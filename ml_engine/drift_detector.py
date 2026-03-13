@@ -1,7 +1,10 @@
 """
 drift_detector.py
 =================
-Enhanced drift detector supporting visualization dashboards.
+Three-fold drift detector:
+1. Statistical drift (baseline z-score)
+2. Behavioral pattern drift
+3. Temporal drift (window-to-window)
 """
 
 from dataclasses import dataclass, field
@@ -54,11 +57,14 @@ class DriftResult:
 
     drift_class: str
     drift_magnitude: float
-
     risk_level: str
 
-    feature_zscores: Dict[str, float] = field(default_factory=dict)
+    # Three drift components
+    statistical_score: float = 0.0
+    behavioral_score: float = 0.0
+    temporal_score: float = 0.0
 
+    feature_zscores: Dict[str, float] = field(default_factory=dict)
     top_drifters: List[Tuple[str, float]] = field(default_factory=list)
 
     penalty: int = 0
@@ -74,14 +80,11 @@ def _zscore(current: float, mean: float, std: float) -> float:
     return min(abs(current - mean) / std, Z_CAP)
 
 
-def compute_drift(
-    device_id: str,
-    window_start: str,
-    current_row: dict,
-    baseline: dict,
-) -> DriftResult:
+# ---------- 1️⃣ Statistical Drift ----------
 
-    zscores: Dict[str, float] = {}
+def compute_statistical_drift(current_row, baseline):
+
+    zscores = {}
 
     for feat in DRIFT_FEATURES:
 
@@ -95,17 +98,68 @@ def compute_drift(
         zscores[feat] = _zscore(current_val, mean, std)
 
     if not zscores:
-
-        return DriftResult(
-            device_id=device_id,
-            window_start=window_start,
-            drift_class=DRIFT_NONE,
-            drift_magnitude=0.0,
-            risk_level="LOW",
-            penalty=0,
-        )
+        return 0.0, {}
 
     magnitude = sum(zscores.values()) / len(zscores)
+
+    return magnitude, zscores
+
+
+# ---------- 2️⃣ Behavioral Drift ----------
+
+def compute_behavioral_drift(zscores):
+
+    # Count how many features have strong anomaly
+    high_anomalies = sum(1 for z in zscores.values() if z > 2)
+
+    behavioral_score = high_anomalies / max(len(zscores), 1) * 5
+
+    return behavioral_score
+
+
+# ---------- 3️⃣ Temporal Drift ----------
+
+def compute_temporal_drift(current_row, prev_row):
+
+    if not prev_row:
+        return 0.0
+
+    diffs = []
+
+    for feat in DRIFT_FEATURES:
+
+        curr = float(current_row.get(feat, 0))
+        prev = float(prev_row.get(feat, 0))
+
+        diff = abs(curr - prev)
+
+        diffs.append(diff)
+
+    if not diffs:
+        return 0.0
+
+    return sum(diffs) / len(diffs) / 100
+
+
+def compute_drift(
+    device_id: str,
+    window_start: str,
+    current_row: dict,
+    baseline: dict,
+    prev_row: dict = None,
+) -> DriftResult:
+
+    # --- Statistical drift ---
+    stat_score, zscores = compute_statistical_drift(current_row, baseline)
+
+    # --- Behavioral drift ---
+    beh_score = compute_behavioral_drift(zscores)
+
+    # --- Temporal drift ---
+    temp_score = compute_temporal_drift(current_row, prev_row)
+
+    # Combined magnitude
+    magnitude = (stat_score + beh_score + temp_score) / 3
 
     if magnitude < 1.5:
         drift_class = DRIFT_NONE
@@ -124,7 +178,13 @@ def compute_drift(
         drift_class=drift_class,
         drift_magnitude=round(magnitude, 2),
         risk_level=risk_level,
+
+        statistical_score=round(stat_score,2),
+        behavioral_score=round(beh_score,2),
+        temporal_score=round(temp_score,2),
+
         feature_zscores={k: round(v, 2) for k, v in zscores.items()},
         top_drifters=[(k, round(v, 2)) for k, v in top_drifters],
+
         penalty=DRIFT_PENALTY[drift_class],
     )
