@@ -8,8 +8,8 @@ import Alerts from './pages/Alerts';
 import Security from './pages/Security';
 import Devices from './pages/Devices';
 import DeviceDetail from './pages/DeviceDetail';
-import PhoneDevices from './components/PhoneDevices';
-import Profiler from './pages/Profiler';
+import Live from './pages/Live';
+import PhoneAgents from './pages/PhoneAgents';
 
 /* SVG Icons as components */
 const IconDashboard = () => (
@@ -50,9 +50,17 @@ const IconDevices = () => (
   </svg>
 );
 
-const IconProfiler = () => (
+const IconLive = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    <circle cx="12" cy="12" r="10" />
+    <circle cx="12" cy="12" r="3" fill="currentColor" />
+  </svg>
+);
+
+const IconPhone = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
+    <line x1="12" y1="18" x2="12.01" y2="18" />
   </svg>
 );
 
@@ -65,16 +73,14 @@ const IconLogout = () => (
 function Sidebar() {
   const navigate = useNavigate();
 
-  const monitorLinks = [
+  const links = [
     { to: '/', label: 'Dashboard', icon: <IconDashboard /> },
+    { to: '/live', label: 'Live', icon: <IconLive /> },
+    { to: '/phones', label: 'Phone Agents', icon: <IconPhone /> },
     { to: '/devices', label: 'Devices', icon: <IconDevices /> },
-    { to: '/profiler', label: 'Device Profiler', icon: <IconProfiler /> },
-    { to: '/analytics', label: 'Visualization', icon: <IconAnalytics /> },
+    { to: '/analytics', label: 'Analytics', icon: <IconAnalytics /> },
     { to: '/network', label: 'Network', icon: <IconNetwork /> },
     { to: '/alerts', label: 'Alerts', icon: <IconAlerts /> },
-  ];
-
-  const respondLinks = [
     { to: '/security', label: 'Security', icon: <IconSecurity /> },
   ];
 
@@ -94,7 +100,7 @@ function Sidebar() {
 
       <nav className="sidebar-nav">
         <div className="sidebar-section-label">Monitor</div>
-        {monitorLinks.map(link => (
+        {links.slice(0, 5).map(link => (
           <NavLink
             key={link.to}
             to={link.to}
@@ -107,7 +113,7 @@ function Sidebar() {
         ))}
 
         <div className="sidebar-section-label" style={{ marginTop: 8 }}>Respond</div>
-        {respondLinks.map(link => (
+        {links.slice(5).map(link => (
           <NavLink
             key={link.to}
             to={link.to}
@@ -158,8 +164,9 @@ function App() {
         <Routes>
           <Route path="/login" element={<Login />} />
           <Route path="/" element={<Dashboard />} />
+                <Route path="/live" element={<Live />} />
+                <Route path="/phones" element={<PhoneAgents />} />
           <Route path="/devices" element={<Devices />} />
-          <Route path="/profiler" element={<Profiler />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/network" element={<Network />} />
           <Route path="/alerts" element={<Alerts />} />

@@ -1,1203 +1,837 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell, PieChart, Pie, Legend,
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+  LineChart, Line, AreaChart, Area, ReferenceLine,
 } from 'recharts';
 
 const API = 'http://localhost:8002/api';
 
-/* ── color maps ─────────────────────────────────────────────── */
-const SEV_COLOR  = { Low: '#22c55e', Medium: '#f59e0b', High: '#f97316', Critical: '#ef4444' };
-const SEV_BG     = { Low: '#f0fdf4', Medium: '#fffbeb', High: '#fff7ed', Critical: '#fef2f2' };
-const SEV_BORDER = { Low: '#bbf7d0', Medium: '#fde68a', High: '#fed7aa', Critical: '#fecaca' };
 const STATUS_COLORS = { COMPLIANT: '#22c55e', SOFT_DRIFT: '#f59e0b', HARD_VIOLATION: '#ef4444' };
-const ACT_COLOR  = { info: '#6366f1', warning: '#f59e0b', error: '#ef4444', success: '#22c55e' };
-const MITRE_COLORS = {
-  TA0043: '#94a3b8', TA0001: '#6366f1', TA0002: '#8b5cf6',
-  TA0003: '#a855f7', TA0007: '#f59e0b', TA0008: '#f97316',
-  TA0010: '#ef4444', TA0011: '#dc2626',
-};
+const DEVICE_COLORS = { CCTV_01: '#3b82f6', Router_01: '#f59e0b', Access_01: '#22c55e' };
+const SEV_COLORS = { Low: '#22c55e', Medium: '#f59e0b', High: '#f97316', Critical: '#ef4444' };
 
-/* ── SVG Radar / Behavioral DNA ─────────────────────────────── */
-function RadarChart({ dimensions, current, baseline, severity, size = 200 }) {
-  const cx = size / 2, cy = size / 2, r = size * 0.36, n = dimensions.length;
-  const angle = i => (i * 2 * Math.PI / n) - Math.PI / 2;
-  const pt    = (i, val) => ({
-    x: cx + r * (val / 100) * Math.cos(angle(i)),
-    y: cy + r * (val / 100) * Math.sin(angle(i)),
-  });
-  const labelPt = i => ({
-    x: cx + (r + 22) * Math.cos(angle(i)),
-    y: cy + (r + 22) * Math.sin(angle(i)),
-  });
-  const poly = vals =>
-    dimensions.map((d, i) => pt(i, vals[d] ?? 0)).map(p => `${p.x},${p.y}`).join(' ');
-  const color = SEV_COLOR[severity] || '#6366f1';
-
-  return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-      {[25, 50, 75, 100].map(v => (
-        <polygon key={v}
-          points={dimensions.map((_, i) => pt(i, v)).map(p => `${p.x},${p.y}`).join(' ')}
-          fill="none" stroke="#f0f0f0" strokeWidth="1"
-        />
-      ))}
-      {dimensions.map((_, i) => (
-        <line key={i} x1={cx} y1={cy} x2={pt(i, 100).x} y2={pt(i, 100).y}
-          stroke="#e2e8f0" strokeWidth="1"
-        />
-      ))}
-      <polygon points={poly(baseline)} fill="rgba(148,163,184,0.15)" stroke="#cbd5e1" strokeWidth="1.5" />
-      <polygon points={poly(current)}  fill={`${color}20`}           stroke={color}    strokeWidth="2"
-        style={{ transition: 'all 0.5s ease' }}
-      />
-      {dimensions.map((d, i) => {
-        const p = pt(i, current[d] ?? 0);
-        return <circle key={i} cx={p.x} cy={p.y} r="3" fill={color} />;
-      })}
-      {dimensions.map((d, i) => {
-        const lp = labelPt(i);
-        const words = d.split(' ');
-        const abbr  = words.map(w => w[0]).join('').toUpperCase();
-        return (
-          <text key={i} x={lp.x} y={lp.y} textAnchor="middle" dominantBaseline="middle"
-            fontSize="9" fill="#64748b" fontWeight="700"
-          >{abbr}</text>
-        );
-      })}
-    </svg>
-  );
+function formatTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.toLocaleString('en-US', { month: 'short' })} ${d.getDate()}, ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
 }
 
-/* ── SVG Network Risk Map ────────────────────────────────────── */
-function RiskMap({ nodes, edges }) {
-  const W = 600, H = 340;
-  const layout = {
-    Router_01:   { x: 300, y: 90  },
-    CCTV_01:     { x: 120, y: 250 },
-    Access_01:   { x: 480, y: 250 },
-    Honeypot_01: { x: 300, y: 295 },
-  };
-  const nodeMap = {};
-  nodes.forEach(n => { nodeMap[n.id] = n; });
+// ── MITRE Stage Mapping ──────────────────────────────────
+const MITRE_STAGES = [
+  { id: 'recon',    label: 'Reconnaissance',    icon: '🔍', color: '#94a3b8', mitre: 'TA0043', desc: 'Attacker gathers info — port scans, unusual destination IPs' },
+  { id: 'access',   label: 'Initial Access',     icon: '🚪', color: '#f59e0b', mitre: 'TA0001', desc: 'Attacker establishes foothold via unknown IPs or exploits' },
+  { id: 'lateral',  label: 'Lateral Movement',   icon: '↔️', color: '#f97316', mitre: 'TA0008', desc: 'Attacker traverses internal network to reach targets' },
+  { id: 'c2',       label: 'Command & Control',  icon: '📡', color: '#ef4444', mitre: 'TA0011', desc: 'Attacker maintains persistent remote control channel' },
+  { id: 'exfil',    label: 'Exfiltration',       icon: '📤', color: '#dc2626', mitre: 'TA0010', desc: 'Attacker extracts sensitive data to external infrastructure' },
+  { id: 'impact',   label: 'Impact',             icon: '💥', color: '#7f1d1d', mitre: 'TA0040', desc: 'Attacker disrupts operations or causes irrecoverable damage' },
+];
 
-  const riskColor = r => r > 60 ? '#ef4444' : r > 30 ? '#f97316' : r > 10 ? '#f59e0b' : '#22c55e';
-  const nodeR     = r => 30 + r * 0.18;
-
-  return (
-    <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
-      {/* Edges */}
-      {edges.map((e, i) => {
-        const f = layout[e.from], t = layout[e.to];
-        if (!f || !t) return null;
-        const active = e.risk_flow > 8;
-        const mx = (f.x + t.x) / 2, my = (f.y + t.y) / 2;
-        return (
-          <g key={i}>
-            <line x1={f.x} y1={f.y} x2={t.x} y2={t.y}
-              stroke={active ? '#ef444466' : '#e2e8f0'}
-              strokeWidth={active ? 2.5 : 1.5}
-              strokeDasharray={active ? '6 3' : 'none'}
-            />
-            {active && (
-              <text x={mx} y={my - 7} textAnchor="middle" fontSize="9" fill="#ef4444" fontWeight="700">
-                {e.risk_flow}% risk
-              </text>
-            )}
-          </g>
-        );
-      })}
-
-      {/* Nodes */}
-      {nodes.map(node => {
-        const pos = layout[node.id];
-        if (!pos) return null;
-        const r     = nodeR(node.risk);
-        const color = node.is_honeypot
-          ? (node.severity === 'Critical' ? '#7c3aed' : '#6366f1')
-          : riskColor(node.risk);
-        const icon  = node.type === 'CCTV' ? '📷' : node.type === 'Router' ? '🌐'
-          : node.type === 'AccessController' ? '🔑' : '🍯';
-
-        return (
-          <g key={node.id}>
-            {node.risk > 25 && (
-              <circle cx={pos.x} cy={pos.y} r={r + 10} fill={`${color}12`} stroke={`${color}30`} strokeWidth="1" />
-            )}
-            <circle cx={pos.x} cy={pos.y} r={r}
-              fill={`${color}18`} stroke={color} strokeWidth="2.5"
-            />
-            <text x={pos.x} y={pos.y - 5} textAnchor="middle" fontSize="15">{icon}</text>
-            {node.risk > 0 && (
-              <text x={pos.x} y={pos.y + 12} textAnchor="middle" fontSize="9" fill={color} fontWeight="800">
-                {node.risk}%
-              </text>
-            )}
-            <text x={pos.x} y={pos.y + r + 14} textAnchor="middle" fontSize="11" fill="#1e293b" fontWeight="700">
-              {node.id}
-            </text>
-            <text x={pos.x} y={pos.y + r + 26} textAnchor="middle" fontSize="9" fill="#64748b">
-              {node.is_honeypot ? '🍯 LURE ACTIVE' : `Trust: ${node.trust}`}
-            </text>
-            {node.is_attacked && (
-              <>
-                <circle cx={pos.x + r - 4} cy={pos.y - r + 4} r="9" fill="#ef4444" />
-                <text x={pos.x + r - 4} y={pos.y - r + 8} textAnchor="middle" fontSize="10" fill="#fff" fontWeight="700">!</text>
-              </>
-            )}
-            {node.is_honeypot && node.severity === 'Critical' && (
-              <>
-                <circle cx={pos.x + r - 4} cy={pos.y - r + 4} r="9" fill="#7c3aed" />
-                <text x={pos.x + r - 4} y={pos.y - r + 9} textAnchor="middle" fontSize="9" fill="#fff">⚡</text>
-              </>
-            )}
-          </g>
-        );
-      })}
-    </svg>
-  );
+function mapEvToMitre(ev) {
+  const t = ((ev.evidence || '') + ' ' + (ev.risk_summary || '') + ' ' + (ev.feature_attribution || '')).toLowerCase();
+  if (t.includes('exfil') || (t.includes('bytes') && t.includes('external'))) return 'exfil';
+  if (t.includes('c2') || t.includes('ssh') || t.includes('command') || t.includes('persistent')) return 'c2';
+  if (t.includes('scan') || t.includes('lateral') || t.includes('internal')) return 'lateral';
+  if (t.includes('external') || t.includes('unknown') || t.includes('access')) return 'access';
+  if (ev.severity === 'Critical' || ev.severity === 'High') return 'impact';
+  return 'recon';
 }
 
-/* ── Kill Chain ─────────────────────────────────────────────── */
-function KillChain({ chain, stagesActive, events, patientZero, activeStage }) {
-  const tactic_order = {};
-  chain.forEach((t, i) => { tactic_order[t.id] = i; });
-
+// ── Judge Info Box ────────────────────────────────────────
+function JudgeCard({ icon, title, what, how }) {
+  const [open, setOpen] = useState(false);
   return (
-    <div>
-      {/* MITRE stage strip */}
-      <div style={{ display: 'flex', gap: 3, marginBottom: 24, overflowX: 'auto', paddingBottom: 4 }}>
-        {chain.map((stage, i) => {
-          const active    = stagesActive.includes(stage.id);
-          const isCurrent = stage.id === activeStage;
-          return (
-            <div key={stage.id} style={{ display: 'flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
-              <div style={{
-                padding: '10px 12px', borderRadius: 10, textAlign: 'center', minWidth: 78,
-                border:     `2px solid ${active ? stage.color : '#e2e8f0'}`,
-                background: active ? `${stage.color}12` : '#f8fafc',
-                opacity:    active ? 1 : 0.45,
-                transition: 'all 0.3s',
-                position:   'relative',
-                cursor:     'default',
-              }}>
-                {isCurrent && (
-                  <div style={{
-                    position: 'absolute', top: -9, left: '50%', transform: 'translateX(-50%)',
-                    background: stage.color, color: '#fff', fontSize: 8, fontWeight: 800,
-                    padding: '2px 7px', borderRadius: 4, whiteSpace: 'nowrap', letterSpacing: 0.5,
-                  }}>◉ ACTIVE</div>
-                )}
-                <div style={{ fontSize: 9, fontWeight: 700, color: active ? stage.color : '#94a3b8', marginBottom: 3 }}>
-                  {stage.id}
-                </div>
-                <div style={{ fontSize: 11, fontWeight: 600, color: active ? '#1e293b' : '#94a3b8' }}>
-                  {stage.short}
-                </div>
-              </div>
-              {i < chain.length - 1 && <div style={{ color: '#cbd5e1', fontSize: 14 }}>›</div>}
-            </div>
-          );
-        })}
+    <div style={{ background: 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)', borderRadius: 12, padding: '14px 18px', marginBottom: 20, border: '1px solid #334155' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }} onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 22 }}>{icon}</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ color: '#f1f5f9', fontWeight: 700, fontSize: 15 }}>{title}</div>
+          <div style={{ color: '#94a3b8', fontSize: 12 }}>{what}</div>
+        </div>
+        <span style={{ color: '#64748b', fontSize: 12, background: '#1e293b', border: '1px solid #334155', padding: '2px 10px', borderRadius: 6 }}>
+          {open ? 'Hide' : 'How it works ▾'}
+        </span>
       </div>
-
-      {/* Patient zero banner */}
-      {patientZero && (
-        <div style={{
-          background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 10,
-          padding: '12px 18px', marginBottom: 18,
-          display: 'flex', alignItems: 'center', gap: 12,
-        }}>
-          <span style={{ fontSize: 22 }}>🎯</span>
-          <div>
-            <div style={{ fontSize: 12, fontWeight: 800, color: '#dc2626', letterSpacing: 0.5 }}>
-              PATIENT ZERO IDENTIFIED
-            </div>
-            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-              First compromise detected on <strong style={{ color: '#1e293b' }}>{patientZero}</strong> —
-              attack chain propagated from this device
-            </div>
-          </div>
+      {open && (
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #334155', color: '#cbd5e1', fontSize: 13, lineHeight: 1.7 }}>
+          {how}
         </div>
       )}
-
-      {/* Event timeline */}
-      <div style={{ maxHeight: 310, overflowY: 'auto' }}>
-        {events.length === 0 ? (
-          <div style={{ textAlign: 'center', color: '#94a3b8', padding: 40, fontSize: 13 }}>
-            🛡 No attack events detected — system operating normally
-          </div>
-        ) : [...events].reverse().map((e, i) => {
-          const mc = MITRE_COLORS[e.mitre_tactic] || '#94a3b8';
-          const stageName = chain.find(s => s.id === e.mitre_tactic)?.name || e.mitre_tactic;
-          return (
-            <div key={i} style={{
-              display: 'flex', gap: 12, padding: '10px 0',
-              borderBottom: '1px solid #f1f5f9', alignItems: 'flex-start',
-            }}>
-              <div style={{ flexShrink: 0, paddingTop: 2 }}>
-                <div style={{
-                  background: `${mc}15`, border: `1px solid ${mc}40`,
-                  borderRadius: 6, padding: '3px 7px', fontSize: 8,
-                  fontWeight: 800, color: mc, textAlign: 'center', whiteSpace: 'nowrap',
-                }}>
-                  {e.mitre_tactic}
-                </div>
-                <div style={{ fontSize: 9, color: mc, textAlign: 'center', marginTop: 2, fontWeight: 600 }}>
-                  {stageName.split(' ').map(w => w.slice(0, 5)).join(' ')}
-                </div>
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 3 }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: '#1e293b' }}>{e.device_id}</span>
-                  <span style={{
-                    fontSize: 10, padding: '1px 8px', borderRadius: 20, fontWeight: 700,
-                    background: SEV_BG[e.severity] || '#f8fafc', color: SEV_COLOR[e.severity] || '#94a3b8',
-                    border: `1px solid ${SEV_BORDER[e.severity] || '#e2e8f0'}`,
-                  }}>{e.severity}</span>
-                </div>
-                <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.5 }}>{e.evidence}</div>
-              </div>
-              <div style={{ fontSize: 10, color: '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0, paddingTop: 2 }}>
-                {new Date(e.window).toLocaleString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-              </div>
-            </div>
-          );
-        })}
-      </div>
     </div>
   );
 }
 
-/* ── Self-Healing Console ────────────────────────────────────── */
-function HealingConsole({ actions }) {
-  const endRef = useRef(null);
-  const ACT_ICON = {
-    MONITOR: '📡', ALERT: '⚠️', THROTTLE: '🔻', BLOCK: '🚫',
-    ISOLATE: '🔒', RESTORE: '✅', FINGERPRINT: '🧬', C2_BLOCK: '⛔',
-    EXFIL_BLOCK: '📤', HEALED: '💚', ATTACK_DETECTED: '🔴',
-  };
+// ── TABS DEFINITION ──────────────────────────────────────
+const TABS = [
+  { id: 'overview',      label: '🛡️ Policy',               },
+  { id: 'behavioral',   label: '🧬 Behavioral DNA',        },
+  { id: 'exfiltration', label: '📤 Exfiltration',          },
+  { id: 'risk_map',     label: '🕸️ Risk Propagation',      },
+  { id: 'selfheal',     label: '🔄 Self-Healing',          },
+  { id: 'honeypot',     label: '🍯 Honeypot',              },
+];
 
-  return (
-    <div style={{
-      background: '#0f172a', borderRadius: 12, padding: '18px 20px',
-      fontFamily: "'Courier New', monospace", maxHeight: 400, overflowY: 'auto',
-      border: '1px solid #1e293b', position: 'relative',
-    }}>
-      <div style={{ color: '#22c55e', fontSize: 11, marginBottom: 14, fontWeight: 700, letterSpacing: 1 }}>
-        ▶ TrustGuard Self-Healing Engine v2.1 — {actions.length > 0 ? 'ACTIVE' : 'STANDBY'}
-      </div>
-      {actions.length === 0 ? (
-        <div style={{ color: '#475569', fontSize: 11 }}>
-          [ No remediation actions required — system nominal ]
-        </div>
-      ) : actions.map((a, i) => {
-        const lc = ACT_COLOR[a.level] || '#94a3b8';
-        const icon = ACT_ICON[a.action] || '•';
-        const ts = (() => {
-          try { return new Date(a.timestamp).toLocaleTimeString(); } catch { return a.timestamp; }
-        })();
-        return (
-          <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 7, alignItems: 'flex-start' }}>
-            <span style={{ color: '#334155', fontSize: 10, whiteSpace: 'nowrap', paddingTop: 1, minWidth: 60 }}>
-              {ts}
-            </span>
-            <span style={{ fontSize: 12, flexShrink: 0 }}>{icon}</span>
-            <span style={{
-              fontSize: 9, fontWeight: 800, padding: '1px 6px', borderRadius: 3, flexShrink: 0,
-              background: `${lc}20`, border: `1px solid ${lc}40`, color: lc, letterSpacing: 0.3,
-            }}>
-              [{a.action}]
-            </span>
-            <span style={{ color: '#94a3b8', fontSize: 11, flex: 1, lineHeight: 1.5 }}>
-              {a.message}
-            </span>
-            {a.automated && (
-              <span style={{ color: '#22c55e', fontSize: 8, whiteSpace: 'nowrap', paddingTop: 2, letterSpacing: 0.5 }}>
-                AUTO
-              </span>
-            )}
-          </div>
-        );
-      })}
-      <div ref={endRef} />
-    </div>
-  );
-}
-
-/* ── Honeypot Panel ─────────────────────────────────────────── */
-function HoneypotPanel({ honeypot }) {
-  if (!honeypot) return null;
-  const triggered = honeypot.triggered;
-
-  return (
-    <div style={{
-      background: triggered ? '#3b0764' : '#0f172a',
-      border: `2px solid ${triggered ? '#7c3aed' : '#1e293b'}`,
-      borderRadius: 16, padding: 24, color: '#e2e8f0',
-      transition: 'all 0.4s',
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20 }}>
-        <div>
-          <div style={{ fontSize: 24, marginBottom: 6 }}>🍯</div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: triggered ? '#c4b5fd' : '#94a3b8' }}>
-            Honeypot Device
-          </div>
-          <div style={{ fontSize: 12, color: '#475569', marginTop: 2, fontFamily: 'monospace' }}>
-            {honeypot.honeypot_ip} — Decoy IoT Node
-          </div>
-        </div>
-        <div style={{
-          padding: '8px 20px', borderRadius: 30, fontSize: 12, fontWeight: 800, letterSpacing: 1,
-          background: triggered ? '#7c3aed' : '#1e3a5f',
-          color: triggered ? '#fff' : '#94a3b8',
-          border: `1px solid ${triggered ? '#a78bfa' : '#334155'}`,
-        }}>
-          {triggered ? '⚡ TRIGGERED' : '🟢 ARMED'}
-        </div>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
-        {[
-          { label: 'Lure Events',       value: honeypot.lure_count,        color: triggered ? '#c4b5fd' : '#94a3b8' },
-          { label: 'Active Injections', value: honeypot.active_injections,  color: triggered ? '#f87171' : '#94a3b8' },
-        ].map(s => (
-          <div key={s.label} style={{
-            background: 'rgba(255,255,255,0.05)', borderRadius: 10, padding: '14px 18px',
-            border: '1px solid rgba(255,255,255,0.08)',
-          }}>
-            <div style={{ fontSize: 28, fontWeight: 800, color: s.color }}>{s.value}</div>
-            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{s.label}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ background: 'rgba(0,0,0,0.3)', borderRadius: 10, padding: 14, fontFamily: 'monospace' }}>
-        <div style={{ fontSize: 10, color: '#475569', marginBottom: 8, fontWeight: 700, letterSpacing: 1 }}>
-          LURE EVENTS LOG
-        </div>
-        {honeypot.lure_events.length === 0 ? (
-          <div style={{ color: '#334155', fontSize: 11 }}>
-            [ No traffic to honeypot — all quiet ]
-          </div>
-        ) : honeypot.lure_events.map((ev, i) => (
-          <div key={i} style={{ fontSize: 11, color: '#94a3b8', marginBottom: 5 }}>
-            <span style={{ color: '#7c3aed' }}>{ev.timestamp?.slice(0, 19)}</span>
-            {' | '}
-            <span style={{ color: '#c4b5fd' }}>{ev.device_id}</span>
-            {' → '}
-            <span style={{ color: '#f87171' }}>{ev.protocol}</span>
-            {' '}
-            <span style={{ color: '#ef4444', fontWeight: 700 }}>⚠ HONEYPOT HIT</span>
-          </div>
-        ))}
-        {triggered && honeypot.lure_events.length === 0 && (
-          <div style={{ color: '#7c3aed', fontSize: 11 }}>
-            [ Risk propagated to honeypot via {honeypot.active_injections} active attack(s) ]
-          </div>
-        )}
-      </div>
-
-      <div style={{ marginTop: 16, fontSize: 11, color: '#475569', lineHeight: 1.7 }}>
-        The honeypot is a dark IoT node that should receive zero legitimate traffic.
-        Any connection attempt indicates lateral movement or adversarial scanning.
-        {triggered && (
-          <span style={{ color: '#c4b5fd', fontWeight: 700 }}>
-            {' '}Threat actor has probed this decoy — attack chain confirmed.
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ══════════════════════════════════════
-   MAIN PAGE
-   ══════════════════════════════════════ */
+// ═══════════════════════════════════════════════════════════
+//  MAIN COMPONENT
+// ═══════════════════════════════════════════════════════════
 function Security() {
-  const [tab,         setTab]         = useState('simulate');
-  const [policyData,  setPolicyData]  = useState({ summary: [], results: [] });
-  const [chainData,   setChainData]   = useState(null);
-  const [fingerprints,setFingerprints]= useState([]);
-  const [riskMap,     setRiskMap]     = useState(null);
-  const [healing,     setHealing]     = useState([]);
-  const [honeypot,    setHoneypot]    = useState(null);
-  const [catalog,     setCatalog]     = useState({});
-  const [injections,  setInjections]  = useState({});
-  const [simLoading,  setSimLoading]  = useState(false);
-  const [simResult,   setSimResult]   = useState(null);
-  const [resetting,   setResetting]   = useState(false);
-  const [loading,     setLoading]     = useState(true);
-  const [lastRefresh, setLastRefresh] = useState(null);
-  const fetchRef = useRef(null);
+  const [activeTab, setActiveTab] = useState('overview');
+  const [summary, setSummary]         = useState([]);
+  const [results, setResults]         = useState([]);
+  const [evidence, setEvidence]       = useState([]);
+  const [traffic, setTraffic]         = useState([]);
+  const [profiles, setProfiles]       = useState([]);
+  const [trustTl, setTrustTl]         = useState([]);
+  const [anomalyTl, setAnomalyTl]     = useState([]);
+  const [unknownIps, setUnknownIps]   = useState([]);
+  const [filter, setFilter]           = useState('all');
+  const [loading, setLoading]         = useState(true);
 
-  const fetchAll = useCallback(async () => {
-    try {
-      const [polSum, polRes, chain, fp, risk, heal, honey, cat, inj] = await Promise.all([
-        axios.get(`${API}/policy-summary`).catch(() => ({ data: [] })),
-        axios.get(`${API}/policy-results`).catch(() => ({ data: [] })),
-        axios.get(`${API}/attack-chain`).catch(() => ({ data: null })),
-        axios.get(`${API}/behavioral-fingerprint`).catch(() => ({ data: [] })),
-        axios.get(`${API}/risk-propagation`).catch(() => ({ data: null })),
-        axios.get(`${API}/self-healing-actions`).catch(() => ({ data: { actions: [] } })),
-        axios.get(`${API}/honeypot-status`).catch(() => ({ data: null })),
-        axios.get(`${API}/attack-catalog`).catch(() => ({ data: {} })),
-        axios.get(`${API}/injection-status`).catch(() => ({ data: { active_injections: {} } })),
-      ]);
-      setPolicyData({ summary: polSum.data || [], results: polRes.data || [] });
-      setChainData(chain.data);
-      setFingerprints(fp.data || []);
-      setRiskMap(risk.data);
-      setHealing(heal.data?.actions || []);
-      setHoneypot(honey.data);
-      setCatalog(cat.data || {});
-      setInjections(inj.data?.active_injections || {});
-      setLastRefresh(new Date().toLocaleTimeString());
+  useEffect(() => {
+    async function fetchAll() {
+      try {
+        const [sRes, rRes, evRes, trRes, prRes, tlRes, anRes] = await Promise.all([
+          axios.get(`${API}/policy-summary`),
+          axios.get(`${API}/policy-results`),
+          axios.get(`${API}/all-evidence`),
+          axios.get(`${API}/network-traffic`),
+          axios.get(`${API}/device-profiles`),
+          axios.get(`${API}/trust-timeline`),
+          axios.get(`${API}/anomaly-timeline`),
+        ]);
+        setSummary(sRes.data);
+        setResults(rRes.data);
+        setEvidence(evRes.data);
+        setTraffic(trRes.data);
+        setProfiles(prRes.data);
+        setTrustTl(tlRes.data);
+        setAnomalyTl(anRes.data);
+
+        // Try live unknown IPs (optional)
+        try {
+          const uRes = await axios.get(`${API}/live/unknown-ips?last_n=50`);
+          setUnknownIps(uRes.data);
+        } catch (_) {}
+
         setLoading(false);
       } catch (err) {
         console.error(err);
         setLoading(false);
       }
+    }
+    fetchAll();
   }, []);
 
-  useEffect(() => { fetchRef.current = fetchAll; }, [fetchAll]);
+  if (loading) return (
+    <div className="loading-container">
+      <div className="loading-spinner" />
+      <div className="loading-text">Loading security intelligence...</div>
+    </div>
+  );
 
-  useEffect(() => {
-    fetchAll();
-    const iv = setInterval(fetchAll, 8000);
-    const onVisible = () => { if (document.visibilityState === 'visible') fetchRef.current?.(); };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => { clearInterval(iv); document.removeEventListener('visibilitychange', onVisible); };
-  }, [fetchAll]);
+  // ── Derived data ────────────────────────────────────────
 
-  if (loading) {
-    return (
-      <div className="loading-container">
-        <div className="loading-spinner" />
-        <div className="loading-text">Loading security intelligence...</div>
-      </div>
-    );
-  }
-
-  /* ── attack simulation handlers ── */
-  const injectAttack = async (deviceId, attackType) => {
-    setSimLoading(true);
-    setSimResult(null);
-    try {
-      const res = await axios.post(`${API}/inject-attack`, { device_id: deviceId, attack_type: attackType });
-      setSimResult({ ok: true, msg: `✅ ${res.data.attack_name} injected on ${deviceId} — pipeline rerunning, all tabs will update in ~10s` });
-      setTimeout(fetchAll, 3000);
-      setTimeout(fetchAll, 10000);
-    } catch (e) {
-      setSimResult({ ok: false, msg: `❌ Injection failed: ${e.message}` });
-    }
-    setSimLoading(false);
-  };
-
-  const resetAll = async () => {
-    setResetting(true);
-    setSimResult(null);
-    try {
-      await axios.post(`${API}/reset`);
-      setSimResult({ ok: true, msg: '✅ System reset to clean baseline — all devices restored to green' });
-      setTimeout(fetchAll, 4000);
-    } catch (e) {
-      setSimResult({ ok: false, msg: `❌ Reset failed: ${e.message}` });
-    }
-    setResetting(false);
-  };
-
-  /* policy helpers */
+  // Policy
   const statusCounts = {};
-  policyData.results.forEach(r => {
-    statusCounts[r.policy_status] = (statusCounts[r.policy_status] || 0) + 1;
-  });
-  const pieData    = Object.entries(statusCounts).map(([s, c]) => ({ status: s, count: c }));
-  const violations = policyData.results.filter(r => r.policy_status !== 'COMPLIANT').slice(0, 20);
+  results.forEach(r => { statusCounts[r.policy_status] = (statusCounts[r.policy_status] || 0) + 1; });
+  const pieData = Object.entries(statusCounts).map(([status, count]) => ({ status, count }));
+  const violations = results.filter(r => filter === 'all' ? r.policy_status !== 'COMPLIANT' : r.policy_status === filter);
+  const complianceChartData = summary.map(s => ({
+    device: s.device_id, compliance: s.compliance_rate, violations: 100 - s.compliance_rate,
+    hasHardViolation: s.hard_violation > 0, hasSoftDrift: s.soft_drift > 0,
+  }));
 
-  const TABS = [
-    { id: 'simulate',   label: '🚀 Simulate Attack',  desc: 'Inject & Watch' },
-    { id: 'killchain',  label: '⛓ Kill Chain',        desc: 'MITRE ATT&CK' },
-    { id: 'behavioral', label: '🧬 Behavioral DNA',    desc: 'Fingerprinting' },
-    { id: 'riskmap',    label: '🗺 Risk Map',          desc: 'Network Map' },
-    { id: 'healing',    label: '💊 Self-Healing',      desc: 'Auto-Response' },
-    { id: 'honeypot',   label: '🍯 Honeypot',          desc: 'Decoy Lure' },
-    { id: 'policy',     label: '📋 Policy',            desc: 'Compliance' },
+  // Attack chain: group evidence by MITRE stage
+  const mitreMap = {};
+  MITRE_STAGES.forEach(s => { mitreMap[s.id] = []; });
+  evidence.forEach(ev => {
+    const stage = mapEvToMitre(ev);
+    mitreMap[stage].push(ev);
+  });
+
+  // Behavioral DNA: per-device feature radar using traffic data
+  const deviceIds = ['CCTV_01', 'Router_01', 'Access_01'];
+  const radarData = (() => {
+    const feats = ['total_bytes_out', 'total_packets_out', 'num_flows', 'unique_dst_ips', 'unique_dst_ports', 'external_ratio'];
+    // Get last 10 windows per device, average
+    const devAvg = {};
+    deviceIds.forEach(did => {
+      const devTr = traffic.filter(t => t.device_id === did).slice(-10);
+      if (!devTr.length) return;
+      const avg = {};
+      feats.forEach(f => { avg[f] = devTr.reduce((s, t) => s + (t[f] || 0), 0) / devTr.length; });
+      devAvg[did] = avg;
+    });
+    // Normalize across all devices for radar (0-100)
+    const maxes = {};
+    feats.forEach(f => { maxes[f] = Math.max(...Object.values(devAvg).map(d => d[f] || 0), 1); });
+    return feats.map(f => {
+      const row = { feature: f.replace('total_', '').replace(/_/g, ' ') };
+      Object.entries(devAvg).forEach(([did, avg]) => {
+        row[did] = Math.round((avg[f] / maxes[f]) * 100);
+      });
+      return row;
+    });
+  })();
+
+  // Exfiltration: windows with high external_ratio
+  const exfilWindows = traffic
+    .filter(t => t.external_ratio > 0.3 || t.total_bytes_out > 500000)
+    .map(t => ({ ...t, risk: t.external_ratio > 0.5 ? 'High' : t.external_ratio > 0.3 ? 'Medium' : 'Low' }));
+
+  const exfilTimeline = (() => {
+    const byWindow = {};
+    traffic.forEach(t => {
+      const k = t.window;
+      if (!byWindow[k]) byWindow[k] = { window: t.window };
+      byWindow[k][t.device_id] = t.external_ratio;
+    });
+    return Object.values(byWindow).sort((a, b) => new Date(a.window) - new Date(b.window)).slice(-30);
+  })();
+
+  // Self-healing: trust timeline to detect → recover cycles
+  const trustByDevice = {};
+  trustTl.forEach(t => {
+    if (!trustByDevice[t.device_id]) trustByDevice[t.device_id] = [];
+    trustByDevice[t.device_id].push(t);
+  });
+  // Find episodes where trust dropped below 60 then recovered
+  const healingEvents = [];
+  Object.entries(trustByDevice).forEach(([did, entries]) => {
+    let inDrop = false;
+    let dropStart = null;
+    entries.forEach((e, i) => {
+      if (!inDrop && e.trust_score < 60) {
+        inDrop = true; dropStart = e;
+      } else if (inDrop && e.trust_score >= 70) {
+        healingEvents.push({ device: did, dropAt: dropStart.window, recoveredAt: e.window, minScore: Math.min(...entries.slice(entries.indexOf(dropStart), i + 1).map(x => x.trust_score)) });
+        inDrop = false; dropStart = null;
+      }
+    });
+  });
+
+  // Digital twin: compare profile vs actual last 10w avg
+  const twinData = profiles.map(p => {
+    const deviceId = deviceIds.find(d => d.startsWith(p.device_type === 'AccessController' ? 'Access' : p.device_type));
+    const devTr = traffic.filter(t => t.device_id === deviceId).slice(-10);
+    const avgBytes = devTr.length ? devTr.reduce((s, t) => s + t.total_bytes_out, 0) / devTr.length : 0;
+    const avgIps = devTr.length ? devTr.reduce((s, t) => s + t.unique_dst_ips, 0) / devTr.length : 0;
+    const avgPorts = devTr.length ? devTr.reduce((s, t) => s + t.unique_dst_ports, 0) / devTr.length : 0;
+    const avgExtRatio = devTr.length ? devTr.reduce((s, t) => s + t.external_ratio, 0) / devTr.length : 0;
+    return {
+      type: p.device_type, deviceId,
+      profile: p,
+      actual: { bytes: avgBytes, ips: avgIps, ports: avgPorts, extRatio: avgExtRatio },
+      metrics: [
+        { label: 'Bandwidth', expected: p.bandwidth_max_bytes, actual: avgBytes, unit: 'B', pct: Math.min(200, Math.round(avgBytes / Math.max(p.bandwidth_max_bytes, 1) * 100)) },
+        { label: 'Unique IPs', expected: p.max_unique_dst_ips, actual: Math.round(avgIps), unit: '', pct: Math.min(200, Math.round(avgIps / Math.max(p.max_unique_dst_ips, 1) * 100)) },
+        { label: 'Unique Ports', expected: p.max_unique_dst_ports, actual: Math.round(avgPorts), unit: '', pct: Math.min(200, Math.round(avgPorts / Math.max(p.max_unique_dst_ports, 1) * 100)) },
+        { label: 'External %', expected: p.allow_external ? 50 : 0, actual: Math.round(avgExtRatio * 100), unit: '%', pct: p.allow_external ? Math.min(200, Math.round(avgExtRatio * 200)) : avgExtRatio > 0.05 ? 200 : 0 },
+      ],
+    };
+  });
+
+  // Honeypot: show attack catalog as honeypot intelligence
+  const honeypotDevices = [
+    { id: 'HONEY_CAM_01', type: 'IP Camera', role: 'Lures exfiltration & C2 attacks', status: 'active', caught: unknownIps.filter(u => u.device_id === 'CCTV_01').length },
+    { id: 'HONEY_RTR_01', type: 'Smart Router', role: 'Detects lateral movement & DNS tunneling', status: 'active', caught: unknownIps.filter(u => u.device_id === 'Router_01').length },
+    { id: 'HONEY_ACC_01', type: 'Access Controller', role: 'Identifies credential stuffing attempts', status: 'active', caught: unknownIps.filter(u => u.device_id === 'Access_01').length },
   ];
 
-  const attackCount   = chainData?.events?.length ?? 0;
-  const honeypotAlert = honeypot?.triggered ?? false;
-  const healingActs   = healing.filter(a => a.automated).length;
-
+  // ═══════════════════════════════════════════════════════
+  //  RENDER
+  // ═══════════════════════════════════════════════════════
   return (
     <>
-      {/* ── Page header ── */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 24 }}>
-        <div>
-          <h1 className="page-title">Security Intelligence</h1>
-          <p className="page-subtitle">
-            Kill chain · Behavioral fingerprinting · Risk propagation · Self-healing response
-          </p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          {honeypotAlert && (
-            <div style={{
-              background: '#7c3aed', color: '#fff', borderRadius: 8,
-              padding: '6px 14px', fontSize: 11, fontWeight: 800,
-              display: 'flex', alignItems: 'center', gap: 6, letterSpacing: 0.5,
-            }}>
-              🍯 HONEYPOT TRIGGERED
-            </div>
-          )}
-          {attackCount > 0 && (
-            <div style={{
-              background: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626',
-              borderRadius: 8, padding: '6px 14px', fontSize: 11, fontWeight: 700,
-            }}>
-              ⚠ {attackCount} Attack Events
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: '#94a3b8' }}>Updated {lastRefresh}</div>
-          <button onClick={fetchAll} style={{
-            background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
-            padding: '6px 14px', fontSize: 12, cursor: 'pointer', color: '#64748b',
-          }}>↺ Refresh</button>
-        </div>
+      <div className="page-title-section">
+        <h1 className="page-title">Advanced Security Intelligence</h1>
+        <p className="page-subtitle">Digital Twin · Attack Chain · Behavioral DNA · Exfiltration · Risk Propagation · Self-Healing · Honeypot</p>
       </div>
 
-      {/* ── Summary bar ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
-        {[
-          { icon: '⛓', label: 'Kill Chain Events', value: attackCount,     color: '#ef4444', bg: '#fef2f2' },
-          { icon: '🧬', label: 'Devices Fingerprinted', value: fingerprints.length, color: '#6366f1', bg: '#eef2ff' },
-          { icon: '💊', label: 'Healing Actions',   value: healingActs,    color: '#22c55e', bg: '#f0fdf4' },
-          { icon: '🍯', label: 'Honeypot Status',   value: honeypotAlert ? 'TRIGGERED' : 'ARMED', color: '#7c3aed', bg: '#f5f3ff' },
-        ].map(s => (
-          <div key={s.label} style={{
-            background: s.bg, border: `1px solid ${s.color}30`,
-            borderRadius: 12, padding: '14px 18px',
-            display: 'flex', alignItems: 'center', gap: 12,
-          }}>
-            <span style={{ fontSize: 24 }}>{s.icon}</span>
-            <div>
-              <div style={{ fontSize: 22, fontWeight: 800, color: s.color }}>{s.value}</div>
-              <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* ── Tab bar ── */}
-      <div style={{ display: 'flex', gap: 2, marginBottom: 20, borderBottom: '2px solid #f1f5f9' }}>
+      {/* ── Tab Bar ── */}
+      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 20, background: '#f8fafc', padding: 6, borderRadius: 12, border: '1px solid #e2e8f0' }}>
         {TABS.map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{
-            padding: '10px 16px', border: 'none', cursor: 'pointer', background: 'transparent',
-            borderBottom: tab === t.id ? '2px solid #6366f1' : '2px solid transparent',
-            marginBottom: -2, borderRadius: '8px 8px 0 0',
-            color: tab === t.id ? '#6366f1' : '#64748b',
-            fontWeight: tab === t.id ? 700 : 500, fontSize: 13, transition: 'all 0.2s',
-          }}>
+          <button key={t.id} onClick={() => setActiveTab(t.id)}
+            style={{
+              padding: '7px 14px', borderRadius: 8, border: 'none', fontSize: 12, fontWeight: 600,
+              cursor: 'pointer', fontFamily: 'inherit', transition: 'all 0.15s',
+              background: activeTab === t.id ? '#1e293b' : 'transparent',
+              color: activeTab === t.id ? '#fff' : '#64748b',
+            }}>
             {t.label}
           </button>
         ))}
       </div>
 
-      {/* ══ Simulate Attack ══ */}
-      {tab === 'simulate' && (
-        <div>
-          {/* Active injections banner */}
-          {Object.keys(injections).length > 0 && (
-            <div style={{
-              background: '#fef2f2', border: '2px solid #fecaca', borderRadius: 12,
-              padding: '14px 20px', marginBottom: 20,
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-            }}>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 800, color: '#dc2626', marginBottom: 6 }}>
-                  ⚠ ACTIVE ATTACKS — {Object.keys(injections).length} device(s) compromised
-                </div>
-                {Object.entries(injections).map(([dev, inj]) => (
-                  <div key={dev} style={{ fontSize: 12, color: '#64748b', marginBottom: 2 }}>
-                    <strong style={{ color: '#1e293b' }}>{dev}</strong>: {inj.attack_name} · {inj.mitre} · injected at {new Date(inj.injected_at).toLocaleTimeString()}
+      {/* ══════════════════════════════════════════
+          TAB: POLICY OVERVIEW
+         ══════════════════════════════════════════ */}
+      {activeTab === 'overview' && (
+        <>
+          <JudgeCard icon="🛡️" title="Policy Compliance Engine"
+            what="Real-time enforcement of device-specific behavioral policies using 3-tier rule evaluation"
+            how="Each IoT device has a pre-defined security policy (allowed protocols, IP ranges, port lists, bandwidth limits). Every hourly window is evaluated against the policy. Violations are classified as SOFT_DRIFT (minor deviation) or HARD_VIOLATION (clear breach). Trust score is penalized by -10 to -30 points per violation." />
+          <div className="stats-bar">
+            {summary.map(s => {
+              const rc = s.hard_violation > 0 ? 'bad' : s.soft_drift > 0 ? 'warn' : 'good';
+              return (
+                <div key={s.device_id} className="compliance-card">
+                  <div className="compliance-device-name">{s.device_id}</div>
+                  <div className="compliance-type">{s.device_type}</div>
+                  <div className={`compliance-rate ${rc}`}>{s.compliance_rate}%</div>
+                  <div className="compliance-bar-track">
+                    <div className={`compliance-bar-fill ${rc}`} style={{ width: `${s.compliance_rate}%` }} />
                   </div>
+                  <div className="compliance-detail">
+                    <span><span className="dot-green" />{s.compliant} OK</span>
+                    <span><span className="dot-yellow" />{s.soft_drift} Drift</span>
+                    <span><span className="dot-red" />{s.hard_violation} Violation</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="two-col-grid">
+            <div className="panel">
+              <div className="panel-header"><div><div className="panel-title">Compliance by Device</div><div className="panel-subtitle">% compliant windows per device</div></div></div>
+              <div className="panel-body"><div className="chart-container small">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={complianceChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis dataKey="device" tick={{ fontSize: 11, fill: '#64748b' }} tickLine={false} />
+                    <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#94a3b8' }} tickLine={false} width={35} tickFormatter={v => `${v}%`} />
+                    <Tooltip formatter={v => `${v}%`} contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                    <Bar dataKey="compliance" name="Compliant" radius={[6, 6, 0, 0]}>
+                      {complianceChartData.map((d, i) => <Cell key={i} fill={d.hasHardViolation ? '#ef4444' : d.hasSoftDrift ? '#f59e0b' : '#22c55e'} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div></div>
+            </div>
+            <div className="panel">
+              <div className="panel-header"><div><div className="panel-title">Status Distribution</div><div className="panel-subtitle">Overall policy evaluation results</div></div></div>
+              <div className="panel-body"><div className="chart-container small">
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie data={pieData} dataKey="count" nameKey="status" cx="50%" cy="50%" innerRadius={55} outerRadius={90} paddingAngle={3}
+                      label={({ status, count }) => `${status.replace('_', ' ')}: ${count}`} style={{ fontSize: 11 }}>
+                      {pieData.map((p, i) => <Cell key={i} fill={STATUS_COLORS[p.status] || '#94a3b8'} />)}
+                    </Pie>
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                    <Legend verticalAlign="bottom" height={30} wrapperStyle={{ fontSize: 11 }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div></div>
+            </div>
+          </div>
+          <div className="panel">
+            <div className="panel-header">
+              <div><div className="panel-title">Violations Log</div><div className="panel-subtitle">Non-compliant evaluations</div></div>
+            </div>
+            <div className="panel-body">
+              <div className="filter-bar">
+                <span style={{ fontSize: 12, color: '#64748b', marginRight: 4 }}>Status:</span>
+                {['all', 'SOFT_DRIFT', 'HARD_VIOLATION'].map(f => (
+                  <button key={f} className={`filter-btn ${filter === f ? 'active' : ''}`} onClick={() => setFilter(f)}>
+                    {f === 'all' ? 'All Non-Compliant' : f.replace('_', ' ')}
+                  </button>
                 ))}
               </div>
-              <button onClick={resetAll} disabled={resetting} style={{
-                background: resetting ? '#f1f5f9' : '#fff',
-                border: '2px solid #e2e8f0', borderRadius: 10,
-                padding: '10px 20px', fontSize: 12, fontWeight: 700,
-                cursor: resetting ? 'not-allowed' : 'pointer', color: '#64748b',
-                flexShrink: 0, marginLeft: 16,
-              }}>
-                {resetting ? '⏳ Resetting...' : '↺ Reset to Baseline'}
-              </button>
             </div>
-          )}
-
-          {/* Result message */}
-          {simResult && (
-            <div style={{
-              padding: '12px 18px', borderRadius: 10, marginBottom: 20,
-              fontSize: 12, fontWeight: 600,
-              background: simResult.ok ? '#f0fdf4' : '#fef2f2',
-              border: `1px solid ${simResult.ok ? '#bbf7d0' : '#fecaca'}`,
-              color: simResult.ok ? '#16a34a' : '#dc2626',
-            }}>
-              {simResult.msg}
-            </div>
-          )}
-
-          {/* Instruction bar */}
-          <div style={{
-            background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 10,
-            padding: '12px 18px', marginBottom: 24, fontSize: 12, color: '#4338ca',
-            display: 'flex', alignItems: 'center', gap: 10,
-          }}>
-            <span style={{ fontSize: 20 }}>💡</span>
-            <span>
-              <strong>Demo flow:</strong> Click any attack below → pipeline reruns (~10s) →
-              switch to <strong>⛓ Kill Chain</strong>, <strong>🧬 Behavioral DNA</strong>,{' '}
-              <strong>🗺 Risk Map</strong>, and <strong>💊 Self-Healing</strong> tabs to watch everything change live.
-            </span>
-          </div>
-
-          {/* Device attack cards */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 20 }}>
-            {Object.entries(catalog).map(([deviceType, attacks]) => {
-              const deviceIds = { CCTV: 'CCTV_01', Router: 'Router_01', AccessController: 'Access_01' };
-              const deviceId  = deviceIds[deviceType] || deviceType;
-              const isActive  = !!injections[deviceId];
-              const fp        = fingerprints.find(f => f.device_id === deviceId);
-              const icons     = { CCTV: '📷', Router: '🌐', AccessController: '🔑' };
-
-              return (
-                <div key={deviceType} style={{
-                  background: '#fff', borderRadius: 16, overflow: 'hidden',
-                  border: `2px solid ${isActive ? '#ef4444' : '#e2e8f0'}`,
-                  boxShadow: isActive ? '0 0 0 4px rgba(239,68,68,0.08)' : '0 2px 8px rgba(0,0,0,0.04)',
-                  transition: 'all 0.3s',
-                }}>
-                  {isActive && (
-                    <div style={{
-                      background: 'linear-gradient(90deg,#ef4444,#dc2626)',
-                      color: '#fff', fontSize: 10, fontWeight: 800,
-                      textAlign: 'center', padding: '5px 0', letterSpacing: 1.5,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
-                    }}>
-                      <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#fff', opacity: 0.85, display: 'inline-block' }} />
-                      ATTACK ACTIVE
-                    </div>
-                  )}
-                  <div style={{ padding: 20 }}>
-                    {/* Device header */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
-                      <span style={{ fontSize: 24 }}>{icons[deviceType] || '📡'}</span>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 15, fontWeight: 700, color: '#1e293b' }}>{deviceId}</div>
-                        <div style={{ fontSize: 11, color: '#64748b' }}>{deviceType}</div>
-                      </div>
-                      {fp && (
-                        <span style={{
-                          fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 20,
-                          background: SEV_BG[fp.severity], color: SEV_COLOR[fp.severity],
-                          border: `1px solid ${SEV_BORDER[fp.severity]}`,
-                        }}>{fp.severity}</span>
-                      )}
-                    </div>
-
-                    {/* Trust bar */}
-                    {fp && (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-                        <div style={{ fontSize: 11, color: '#64748b', width: 32, flexShrink: 0 }}>Trust</div>
-                        <div style={{ flex: 1, height: 6, background: '#f0f0f0', borderRadius: 3 }}>
-                          <div style={{
-                            height: '100%', borderRadius: 3, transition: 'width 0.5s',
-                            width: `${fp.trust_score}%`,
-                            background: SEV_COLOR[fp.severity],
-                          }} />
-                        </div>
-                        <div style={{ fontSize: 12, fontWeight: 700, color: SEV_COLOR[fp.severity], width: 44, textAlign: 'right' }}>
-                          {fp.trust_score}/100
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Attack buttons */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      {attacks.map(attack => (
-                        <button
-                          key={attack.id}
-                          onClick={() => injectAttack(deviceId, attack.id)}
-                          disabled={simLoading}
-                          style={{
-                            background: simLoading ? '#f8fafc' : '#fff',
-                            border: '1.5px solid #e2e8f0', borderRadius: 10,
-                            padding: '12px 16px', cursor: simLoading ? 'not-allowed' : 'pointer',
-                            textAlign: 'left', transition: 'all 0.15s',
-                            opacity: simLoading ? 0.6 : 1,
-                          }}
-                          onMouseEnter={e => { if (!simLoading) { e.currentTarget.style.borderColor = '#ef4444'; e.currentTarget.style.background = '#fef2f2'; } }}
-                          onMouseLeave={e => { e.currentTarget.style.borderColor = '#e2e8f0'; e.currentTarget.style.background = simLoading ? '#f8fafc' : '#fff'; }}
-                        >
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
-                            <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{attack.name}</span>
-                            <span style={{
-                              fontSize: 9, fontWeight: 800, color: '#ef4444',
-                              background: '#fef2f2', padding: '2px 8px', borderRadius: 4, letterSpacing: 0.5,
-                            }}>
-                              {simLoading ? '⏳' : '⚡ INJECT'}
-                            </span>
-                          </div>
-                          <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.5 }}>{attack.description}</div>
-                          <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 5, fontFamily: 'monospace' }}>{attack.mitre}</div>
-                        </button>
+            <div className="panel-body no-padding" style={{ paddingTop: 0 }}>
+              {violations.length === 0 ? <div className="table-empty">No violations for this filter.</div> : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="data-table">
+                    <thead><tr><th>Time</th><th>Device</th><th>Type</th><th>Status</th><th>Violations</th><th>Penalty</th></tr></thead>
+                    <tbody>
+                      {violations.slice(0, 50).map((v, i) => (
+                        <tr key={i}>
+                          <td className="table-cell-time">{formatTime(v.window)}</td>
+                          <td className="table-cell-device">{v.device_id}</td>
+                          <td style={{ fontSize: 12, color: '#64748b' }}>{v.device_type}</td>
+                          <td><span className={`severity-badge ${v.policy_status === 'HARD_VIOLATION' ? 'high' : 'medium'}`}>{v.policy_status.replace('_', ' ')}</span></td>
+                          <td style={{ fontSize: 12, maxWidth: 300 }}>{v.violations}</td>
+                          <td style={{ fontWeight: 600, color: v.penalty >= 25 ? '#ef4444' : '#f59e0b' }}>-{v.penalty}</td>
+                        </tr>
                       ))}
-                    </div>
-                  </div>
+                    </tbody>
+                  </table>
                 </div>
-              );
-            })}
-            {Object.keys(catalog).length === 0 && (
-              <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: 48, color: '#94a3b8' }}>
-                Loading attack catalog...
-              </div>
-            )}
-      </div>
-
-          {/* Reset button at bottom */}
-          <div style={{ textAlign: 'center', marginTop: 28 }}>
-            <button onClick={resetAll} disabled={resetting} style={{
-              background: '#f8fafc', border: '1.5px solid #e2e8f0', borderRadius: 10,
-              padding: '11px 28px', fontSize: 12, fontWeight: 700,
-              cursor: resetting ? 'not-allowed' : 'pointer', color: '#64748b',
-            }}>
-              {resetting ? '⏳ Resetting pipeline...' : '↺ Reset all devices to clean baseline'}
-            </button>
+              )}
+            </div>
           </div>
-        </div>
+        </>
       )}
 
-      {/* ══ Kill Chain ══ */}
-      {tab === 'killchain' && (
-        <div className="panel">
-          <div className="panel-header">
-            <div>
-              <div className="panel-title">MITRE ATT&CK Kill Chain Analyzer</div>
-              <div className="panel-subtitle">
-                Attack progression mapped to MITRE framework — {attackCount} events detected
-                {chainData?.patient_zero && ` · Patient Zero: ${chainData.patient_zero}`}
+
+
+      {/* ══════════════════════════════════════════
+          TAB: BEHAVIORAL DNA / FINGERPRINTING
+         ══════════════════════════════════════════ */}
+      {activeTab === 'behavioral' && (
+        <>
+          <JudgeCard icon="🧬" title="Behavioral Fingerprinting — Device DNA"
+            what="Unique traffic fingerprint per device — detects identity spoofing and behavioral drift"
+            how={<>
+              Every IoT device has a <strong style={{color:'#94d2bd'}}>behavioral fingerprint</strong> — a unique multi-dimensional signature of its normal traffic patterns (bandwidth, flow counts, port diversity, external ratio).<br /><br />
+              <strong style={{color:'#94d2bd'}}>How it detects attacks:</strong> If a device starts behaving like a different device (e.g., a camera suddenly making DNS queries like a router), the fingerprint diverges. This catches <em>identity spoofing</em>, <em>device impersonation</em>, and <em>covert channel</em> attacks.<br /><br />
+              <strong style={{color:'#f59e0b'}}>Demo:</strong> The radar chart shows each device's traffic DNA. Compare shapes — a compromised device's shape will deform.
+            </>} />
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div className="panel">
+              <div className="panel-header"><div><div className="panel-title">Traffic Fingerprint Radar</div><div className="panel-subtitle">Normalized behavioral DNA — 6 feature dimensions</div></div></div>
+              <div className="panel-body" style={{ height: 320 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <RadarChart data={radarData} margin={{ top: 10, right: 30, bottom: 10, left: 30 }}>
+                    <PolarGrid stroke="#e2e8f0" />
+                    <PolarAngleAxis dataKey="feature" tick={{ fontSize: 11, fill: '#64748b' }} />
+                    <PolarRadiusAxis angle={30} domain={[0, 100]} tick={{ fontSize: 9, fill: '#94a3b8' }} tickCount={4} />
+                    {deviceIds.map((did, i) => (
+                      <Radar key={did} name={did} dataKey={did} stroke={Object.values(DEVICE_COLORS)[i]} fill={Object.values(DEVICE_COLORS)[i]} fillOpacity={0.15} strokeWidth={2} />
+                    ))}
+                    <Legend verticalAlign="bottom" wrapperStyle={{ fontSize: 12 }} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                  </RadarChart>
+                </ResponsiveContainer>
               </div>
             </div>
-            {chainData?.active_stage && (
-              <div style={{
-                background: `${MITRE_COLORS[chainData.active_stage] || '#94a3b8'}15`,
-                border: `1px solid ${MITRE_COLORS[chainData.active_stage] || '#e2e8f0'}`,
-                borderRadius: 8, padding: '6px 14px',
-                fontSize: 11, fontWeight: 700,
-                color: MITRE_COLORS[chainData.active_stage] || '#64748b',
-              }}>
-                Active: {chainData.chain?.find(s => s.id === chainData.active_stage)?.name || chainData.active_stage}
-              </div>
-            )}
-          </div>
-          <div className="panel-body">
-            {chainData ? (
-              <KillChain
-                chain={chainData.chain || []}
-                stagesActive={chainData.stages_active || []}
-                events={chainData.events || []}
-                patientZero={chainData.patient_zero}
-                activeStage={chainData.active_stage}
-              />
-            ) : (
-              <div style={{ textAlign: 'center', color: '#94a3b8', padding: 40 }}>No kill chain data available</div>
-            )}
-          </div>
-        </div>
-      )}
 
-      {/* ══ Behavioral DNA ══ */}
-      {tab === 'behavioral' && (
-        <div>
-          <div style={{ background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 10, padding: '12px 18px', marginBottom: 20, fontSize: 12, color: '#4338ca' }}>
-            <strong>Behavioral DNA Fingerprinting</strong> — Each device's network behavior is decomposed into 6 
-            dimensions and compared against its personal baseline. Deviations (red/orange bars) indicate anomalous 
-            activity consistent with compromise, lateral movement, or exfiltration.
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))', gap: 18 }}>
-            {fingerprints.map(fp => {
-              const color = SEV_COLOR[fp.severity] || '#22c55e';
-              const maxDelta = Math.max(0, ...fp.dimensions.map(d => (fp.current[d] ?? 0) - (fp.baseline[d] ?? 0)));
-              return (
-                <div key={fp.device_id} style={{
-                  background: '#fff', borderRadius: 16, overflow: 'hidden',
-                  border: `2px solid ${maxDelta > 30 ? color : SEV_BORDER[fp.severity] || '#e2e8f0'}`,
-                  boxShadow: maxDelta > 30 ? `0 0 0 3px ${color}15` : '0 2px 8px rgba(0,0,0,0.04)',
-                }}>
-                  <div style={{
-                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    padding: '14px 20px', borderBottom: '1px solid #f1f5f9',
-                  }}>
-                    <div>
-                      <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{fp.device_id}</div>
-                      <div style={{ fontSize: 11, color: '#64748b' }}>Trust: {fp.trust_score}/100 · Behavioral fingerprint</div>
-                    </div>
-                    <span style={{
-                      fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 20,
-                      background: SEV_BG[fp.severity], color: SEV_COLOR[fp.severity],
-                      border: `1px solid ${SEV_BORDER[fp.severity]}`,
-                    }}>{fp.severity}</span>
-                  </div>
-                  <div style={{ padding: '14px 20px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                    <RadarChart
-                      dimensions={fp.dimensions} current={fp.current}
-                      baseline={fp.baseline} severity={fp.severity} size={200}
-                    />
-                    {/* Dimension bars */}
-                    <div style={{ width: '100%', marginTop: 14 }}>
-                      {fp.dimensions.map(d => {
-                        const cur   = fp.current[d]  ?? 0;
-                        const base  = fp.baseline[d] ?? 0;
-                        const delta = cur - base;
-                        const isHigh = delta > 30;
-                        const barColor = isHigh ? '#ef4444' : delta > 15 ? '#f97316' : color;
-                        return (
-                          <div key={d} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                            <div style={{ fontSize: 10, color: '#64748b', width: 115, flexShrink: 0 }}>{d}</div>
-                            <div style={{ flex: 1, height: 5, background: '#f0f0f0', borderRadius: 3, overflow: 'hidden' }}>
-                              <div style={{ height: '100%', width: `${Math.min(cur, 100)}%`, borderRadius: 3, background: barColor, transition: 'width 0.5s' }} />
-                            </div>
-                            <div style={{ fontSize: 10, width: 42, textAlign: 'right', fontWeight: 700, color: isHigh ? '#ef4444' : '#64748b' }}>
-                              {delta > 0 ? `+${delta.toFixed(0)}` : delta.toFixed(0)}%
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <div style={{ marginTop: 12, fontSize: 10, color: '#94a3b8', display: 'flex', gap: 14 }}>
-                      <span>
-                        <span style={{ display: 'inline-block', width: 18, height: 2, background: '#cbd5e1', verticalAlign: 'middle', marginRight: 4, borderRadius: 2 }} />
-                        Baseline
-                      </span>
-                      <span>
-                        <span style={{ display: 'inline-block', width: 18, height: 2, background: color, verticalAlign: 'middle', marginRight: 4, borderRadius: 2 }} />
-                        Current
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-            {fingerprints.length === 0 && (
-              <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: 48, color: '#94a3b8', fontSize: 13 }}>
-                No behavioral fingerprint data — run the pipeline first.
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ══ Risk Map ══ */}
-      {tab === 'riskmap' && (
-        <div className="panel">
-          <div className="panel-header">
-            <div>
-              <div className="panel-title">Network Risk Propagation Map</div>
-              <div className="panel-subtitle">
-                Live risk flow between IoT devices — honeypot lure node embedded in topology
+            {/* Fingerprint detail table */}
+            <div className="panel">
+              <div className="panel-header"><div><div className="panel-title">Feature Comparison</div><div className="panel-subtitle">Per-device average over last 10 windows</div></div></div>
+              <div className="panel-body no-padding">
+                <table className="data-table">
+                  <thead><tr><th>Feature</th>{deviceIds.map(d => <th key={d}>{d}</th>)}</tr></thead>
+                  <tbody>
+                    {radarData.map((row, i) => (
+                      <tr key={i}>
+                        <td style={{ fontWeight: 600, fontSize: 12 }}>{row.feature}</td>
+                        {deviceIds.map(did => {
+                          const val = row[did] || 0;
+                          const color = val > 80 ? '#ef4444' : val > 50 ? '#f59e0b' : '#22c55e';
+                          return (
+                            <td key={did} style={{ textAlign: 'center' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>
+                                <div style={{ width: 40, height: 6, background: '#f1f5f9', borderRadius: 3 }}>
+                                  <div style={{ width: `${val}%`, height: '100%', background: color, borderRadius: 3 }} />
+                                </div>
+                                <span style={{ fontSize: 11, fontWeight: 600, color }}>{val}</span>
+                              </div>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
-            {riskMap?.honeypot_triggered && (
-              <div style={{
-                background: '#f5f3ff', border: '1px solid #7c3aed', borderRadius: 8,
-                padding: '6px 14px', fontSize: 11, fontWeight: 700, color: '#7c3aed',
-              }}>
-                🍯 Honeypot Triggered
-              </div>
-            )}
           </div>
-          <div className="panel-body">
-            {riskMap ? (
-              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 28 }}>
-                <div>
-                  <RiskMap nodes={riskMap.nodes} edges={riskMap.edges} />
+
+          {/* Temporal behavior heatmap (anomaly by hour) */}
+          <div className="panel">
+            <div className="panel-header"><div><div className="panel-title">Temporal Behavioral Pattern</div><div className="panel-subtitle">Anomaly score distribution over simulated time — detects time-based attacks (e.g. night-time exfil)</div></div></div>
+            <div className="panel-body"><div className="chart-container">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={anomalyTl.slice(-60)} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis dataKey="window" tick={{ fontSize: 9, fill: '#94a3b8' }} interval={9} tickFormatter={v => formatTime(v)} tickLine={false} />
+                  <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} width={30} />
+                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8 }} formatter={v => v.toFixed(3)} />
+                  <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="4 4" label={{ value: 'Alert threshold', position: 'insideTopRight', fontSize: 10, fill: '#ef4444' }} />
+                  {deviceIds.map((did, i) => (
+                    <Area key={did} type="monotone" dataKey={anomalyTl.find(a => a.device_id === did) ? 'anomaly_score' : ''}
+                      data={anomalyTl.filter(a => a.device_id === did).slice(-60)}
+                      name={did} stroke={Object.values(DEVICE_COLORS)[i]} fill={Object.values(DEVICE_COLORS)[i]} fillOpacity={0.1} strokeWidth={1.5} dot={false} />
+                  ))}
+                  <Legend verticalAlign="top" height={30} wrapperStyle={{ fontSize: 11 }} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div></div>
+          </div>
+        </>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB: DATA EXFILTRATION
+         ══════════════════════════════════════════ */}
+      {activeTab === 'exfiltration' && (
+        <>
+          <JudgeCard icon="📤" title="Data Exfiltration Detection"
+            what="Detects unauthorized outbound data flows to external infrastructure in real-time"
+            how={<>
+              Exfiltration is detected by monitoring <strong style={{color:'#94d2bd'}}>external_ratio</strong> (% of connections going outside the internal network) and <strong style={{color:'#94d2bd'}}>total_bytes_out</strong> per hourly window.<br /><br />
+              <strong style={{color:'#94d2bd'}}>Detection logic:</strong> A window is flagged if external_ratio {'>'} 30% OR bytes_out {'>'} 500KB. Devices with expected external access (Router) use higher thresholds than isolated devices (CCTV, Access Controller).<br /><br />
+              <strong style={{color:'#f59e0b'}}>Demo:</strong> The red zones on the chart show windows where exfiltration-like behavior was detected.
+            </>} />
+
+          {/* External ratio timeline */}
+          <div className="panel" style={{ marginBottom: 16 }}>
+            <div className="panel-header"><div><div className="panel-title">External Connection Ratio Timeline</div><div className="panel-subtitle">% of outbound connections going to external IPs — spikes indicate potential exfiltration</div></div></div>
+            <div className="panel-body"><div className="chart-container">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={exfilTimeline} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis dataKey="window" tick={{ fontSize: 9, fill: '#94a3b8' }} interval={4} tickFormatter={v => formatTime(v)} tickLine={false} />
+                  <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} width={35} tickFormatter={v => `${(v * 100).toFixed(0)}%`} />
+                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8 }} formatter={v => `${(v * 100).toFixed(1)}%`} />
+                  <ReferenceLine y={0.3} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: 'Warn (30%)', position: 'insideTopRight', fontSize: 10, fill: '#f59e0b' }} />
+                  <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="4 4" label={{ value: 'Alert (50%)', position: 'insideTopRight', fontSize: 10, fill: '#ef4444' }} />
+                  {deviceIds.map((did, i) => (
+                    <Area key={did} type="monotone" dataKey={did} name={did} stroke={Object.values(DEVICE_COLORS)[i]} fill={Object.values(DEVICE_COLORS)[i]} fillOpacity={0.15} strokeWidth={2} dot={false} />
+                  ))}
+                  <Legend verticalAlign="top" height={30} wrapperStyle={{ fontSize: 11 }} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div></div>
+          </div>
+
+          {/* Flagged windows */}
+          <div className="panel">
+            <div className="panel-header">
+              <div><div className="panel-title">Flagged Exfiltration Windows</div><div className="panel-subtitle">Windows with high external traffic or unusual byte volumes</div></div>
+              <span className="live-badge" style={{ background: exfilWindows.length > 0 ? '#fee2e2' : '#dcfce7', color: exfilWindows.length > 0 ? '#ef4444' : '#22c55e' }}>
+                {exfilWindows.length} suspect windows
+              </span>
+            </div>
+            <div className="panel-body no-padding" style={{ maxHeight: 320, overflowY: 'auto' }}>
+              {exfilWindows.length === 0 ? <div className="table-empty">No exfiltration patterns detected.</div> : (
+                <table className="alerts-table">
+                  <thead><tr><th>Time</th><th>Device</th><th>Bytes Out</th><th>External %</th><th>Unique IPs</th><th>Risk</th></tr></thead>
+                  <tbody>
+                    {exfilWindows.slice(0, 30).map((w, i) => (
+                      <tr key={i}>
+                        <td style={{ fontSize: 11 }}>{formatTime(w.window)}</td>
+                        <td style={{ fontWeight: 600 }}>{w.device_id}</td>
+                        <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{(w.total_bytes_out / 1024).toFixed(1)} KB</td>
+                        <td style={{ color: w.external_ratio > 0.5 ? '#ef4444' : '#f59e0b', fontWeight: 600 }}>{(w.external_ratio * 100).toFixed(1)}%</td>
+                        <td>{w.unique_dst_ips}</td>
+                        <td><span className={`severity-badge ${w.risk.toLowerCase()}`}>{w.risk}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB: RISK PROPAGATION
+         ══════════════════════════════════════════ */}
+      {activeTab === 'risk_map' && (
+        <>
+          <JudgeCard icon="🕸️" title="Risk Propagation — Network Blast Radius"
+            what="Models how a single compromised IoT device can cascade risk across the entire network"
+            how={<>
+              In IoT networks, devices are <strong style={{color:'#94d2bd'}}>interdependent</strong> — a compromised router can intercept all device traffic; a compromised camera can be used as a pivot point. We model risk propagation using device connectivity graphs.<br /><br />
+              <strong style={{color:'#94d2bd'}}>Algorithm:</strong> Risk score of a device = its own trust deduction + weighted sum of neighbor risk scores. Edge weight = traffic volume between devices. Compromised devices "infect" connected nodes.<br /><br />
+              <strong style={{color:'#f59e0b'}}>Demo:</strong> The graph shows how CCTV compromise propagates through the router to the access control system.
+            </>} />
+
+          {/* Network diagram SVG */}
+          {(() => {
+            const devScores = {};
+            const latestTrust = {};
+            trustTl.forEach(t => { latestTrust[t.device_id] = t; });
+            deviceIds.forEach(did => {
+              const t = latestTrust[did];
+              devScores[did] = t ? t.trust_score : 100;
+            });
+            const getColor = (score) => score >= 70 ? '#22c55e' : score >= 40 ? '#f59e0b' : '#ef4444';
+            const getSev = (score) => score >= 70 ? 'Low' : score >= 40 ? 'Medium' : 'High';
+            return (
+              <div className="panel" style={{ marginBottom: 16 }}>
+                <div className="panel-header"><div><div className="panel-title">Device Risk Graph</div><div className="panel-subtitle">Network topology with live trust scores — compromised devices propagate risk to neighbors</div></div></div>
+                <div className="panel-body" style={{ minHeight: 340, position: 'relative' }}>
+                  <svg width="100%" height="320" viewBox="0 0 800 300" style={{ overflow: 'visible' }}>
+                    {/* Internet node */}
+                    <circle cx="700" cy="150" r="36" fill="#f1f5f9" stroke="#94a3b8" strokeWidth="2" />
+                    <text x="700" y="145" textAnchor="middle" fontSize="11" fill="#64748b" fontWeight="600">Internet</text>
+                    <text x="700" y="160" textAnchor="middle" fontSize="18">🌐</text>
+
+                    {/* Router (center) */}
+                    <circle cx="400" cy="150" r="48" fill={getColor(devScores['Router_01']) + '33'} stroke={getColor(devScores['Router_01'])} strokeWidth="3" />
+                    <text x="400" y="138" textAnchor="middle" fontSize="22">🌐</text>
+                    <text x="400" y="158" textAnchor="middle" fontSize="12" fill="#1e293b" fontWeight="700">Router_01</text>
+                    <text x="400" y="174" textAnchor="middle" fontSize="13" fill={getColor(devScores['Router_01'])} fontWeight="700">{Math.round(devScores['Router_01'])}%</text>
+
+                    {/* CCTV (top-left) */}
+                    <circle cx="140" cy="80" r="44" fill={getColor(devScores['CCTV_01']) + '33'} stroke={getColor(devScores['CCTV_01'])} strokeWidth="3" />
+                    <text x="140" y="68" textAnchor="middle" fontSize="22">📷</text>
+                    <text x="140" y="88" textAnchor="middle" fontSize="12" fill="#1e293b" fontWeight="700">CCTV_01</text>
+                    <text x="140" y="104" textAnchor="middle" fontSize="13" fill={getColor(devScores['CCTV_01'])} fontWeight="700">{Math.round(devScores['CCTV_01'])}%</text>
+
+                    {/* Access (bottom-left) */}
+                    <circle cx="140" cy="230" r="44" fill={getColor(devScores['Access_01']) + '33'} stroke={getColor(devScores['Access_01'])} strokeWidth="3" />
+                    <text x="140" y="218" textAnchor="middle" fontSize="22">🔐</text>
+                    <text x="140" y="238" textAnchor="middle" fontSize="12" fill="#1e293b" fontWeight="700">Access_01</text>
+                    <text x="140" y="254" textAnchor="middle" fontSize="13" fill={getColor(devScores['Access_01'])} fontWeight="700">{Math.round(devScores['Access_01'])}%</text>
+
+                    {/* Edges */}
+                    {/* CCTV → Router */}
+                    <line x1="184" y1="100" x2="355" y2="135" stroke={getColor(devScores['CCTV_01'])} strokeWidth="2.5" strokeDasharray={devScores['CCTV_01'] < 70 ? '6 3' : '0'} opacity="0.7" />
+                    <text x="270" y="108" textAnchor="middle" fontSize="10" fill="#64748b">RTSP</text>
+                    {devScores['CCTV_01'] < 70 && <text x="270" y="123" textAnchor="middle" fontSize="10" fill="#ef4444">⚠ risk flow</text>}
+
+                    {/* Access → Router */}
+                    <line x1="184" y1="210" x2="355" y2="168" stroke={getColor(devScores['Access_01'])} strokeWidth="2.5" strokeDasharray={devScores['Access_01'] < 70 ? '6 3' : '0'} opacity="0.7" />
+                    <text x="270" y="200" textAnchor="middle" fontSize="10" fill="#64748b">HTTPS</text>
+
+                    {/* Router → Internet */}
+                    <line x1="448" y1="150" x2="664" y2="150" stroke={getColor(devScores['Router_01'])} strokeWidth="2.5" strokeDasharray={devScores['Router_01'] < 70 ? '6 3' : '0'} opacity="0.7" />
+                    <text x="556" y="143" textAnchor="middle" fontSize="10" fill="#64748b">DNS / HTTPS</text>
+                    {devScores['Router_01'] < 70 && <text x="556" y="163" textAnchor="middle" fontSize="10" fill="#ef4444">⚠ exfil risk</text>}
+
+                    {/* Auth server (right of Access) */}
+                    <circle cx="310" cy="270" r="28" fill="#f0fdf4" stroke="#22c55e" strokeWidth="1.5" />
+                    <text x="310" y="264" textAnchor="middle" fontSize="14">🖥️</text>
+                    <text x="310" y="281" textAnchor="middle" fontSize="9" fill="#64748b">Auth Server</text>
+                    <line x1="184" y1="246" x2="282" y2="265" stroke="#22c55e" strokeWidth="1.5" opacity="0.6" />
+                  </svg>
+
+                  {/* Legend */}
+                  <div style={{ display: 'flex', gap: 16, justifyContent: 'center', marginTop: 8, fontSize: 12, color: '#64748b' }}>
+                    <span>🟢 Trust ≥70 (Safe)</span>
+                    <span>🟡 Trust 40-70 (Degraded)</span>
+                    <span>🔴 Trust &lt;40 (Compromised)</span>
+                    <span style={{ color: '#94a3b8' }}>--- Risk flowing</span>
+                  </div>
                 </div>
-                <div>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', marginBottom: 14 }}>Device Risk Levels</div>
-                  {riskMap.nodes.map(node => {
-                    const riskColor = node.risk > 60 ? '#ef4444' : node.risk > 30 ? '#f97316' : node.risk > 10 ? '#f59e0b' : '#22c55e';
-                    return (
-                      <div key={node.id} style={{ marginBottom: 14 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 }}>
-                          <span style={{ fontSize: 12, color: '#1e293b', fontWeight: 600 }}>
-                            {node.is_honeypot ? '🍯 ' : ''}{node.id}
-                            {node.is_attacked && <span style={{ marginLeft: 6, fontSize: 10, color: '#ef4444', fontWeight: 700 }}>ATTACKED</span>}
-                          </span>
-                          <span style={{ fontSize: 13, fontWeight: 800, color: riskColor }}>{node.risk}%</span>
+              </div>
+            );
+          })()}
+
+          {/* Propagation impact table */}
+          <div className="panel">
+            <div className="panel-header"><div><div className="panel-title">Propagation Impact Analysis</div><div className="panel-subtitle">How compromise of each device affects the rest of the network</div></div></div>
+            <div className="panel-body no-padding">
+              <table className="data-table">
+                <thead><tr><th>Source Device</th><th>If Compromised →</th><th>At-Risk Neighbors</th><th>Blast Radius</th><th>Max Impact</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td style={{ fontWeight: 600 }}>📷 CCTV_01</td>
+                    <td style={{ fontSize: 12, color: '#64748b' }}>Feeds all video through Router. Attacker gets inside foothold.</td>
+                    <td><span style={{ fontSize: 11, background: '#fef3c7', color: '#d97706', padding: '2px 6px', borderRadius: 4 }}>Router_01</span></td>
+                    <td><div style={{ display: 'flex', gap: 2 }}>{[1,2,3].map(i => <div key={i} style={{ width: 10, height: 10, borderRadius: 2, background: i <= 2 ? '#f59e0b' : '#e2e8f0' }} />)}</div></td>
+                    <td style={{ color: '#f59e0b', fontWeight: 600 }}>Medium</td>
+                  </tr>
+                  <tr>
+                    <td style={{ fontWeight: 600 }}>🌐 Router_01</td>
+                    <td style={{ fontSize: 12, color: '#64748b' }}>Controls all DNS + routing. Attacker sees ALL traffic.</td>
+                    <td>
+                      <span style={{ fontSize: 11, background: '#fee2e2', color: '#ef4444', padding: '2px 6px', borderRadius: 4, marginRight: 4 }}>CCTV_01</span>
+                      <span style={{ fontSize: 11, background: '#fee2e2', color: '#ef4444', padding: '2px 6px', borderRadius: 4 }}>Access_01</span>
+                    </td>
+                    <td><div style={{ display: 'flex', gap: 2 }}>{[1,2,3].map(i => <div key={i} style={{ width: 10, height: 10, borderRadius: 2, background: '#ef4444' }} />)}</div></td>
+                    <td style={{ color: '#ef4444', fontWeight: 600 }}>Critical</td>
+                  </tr>
+                  <tr>
+                    <td style={{ fontWeight: 600 }}>🔐 Access_01</td>
+                    <td style={{ fontSize: 12, color: '#64748b' }}>Credential theft → physical access bypass → lateral movement.</td>
+                    <td><span style={{ fontSize: 11, background: '#fee2e2', color: '#ef4444', padding: '2px 6px', borderRadius: 4 }}>Auth Server</span></td>
+                    <td><div style={{ display: 'flex', gap: 2 }}>{[1,2,3].map(i => <div key={i} style={{ width: 10, height: 10, borderRadius: 2, background: i <= 2 ? '#ef4444' : '#e2e8f0' }} />)}</div></td>
+                    <td style={{ color: '#ef4444', fontWeight: 600 }}>High</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ══════════════════════════════════════════
+          TAB: SELF-HEALING
+         ══════════════════════════════════════════ */}
+      {activeTab === 'selfheal' && (
+        <>
+          <JudgeCard icon="🔄" title="Self-Healing System — Autonomous Response"
+            what="Automatically detects, isolates, monitors, and restores compromised IoT devices"
+            how={<>
+              When trust score drops below <strong style={{color:'#94d2bd'}}>60%</strong>, the system triggers an automated response pipeline:<br /><br />
+              <strong style={{color:'#ef4444'}}>1. Detect</strong> → Anomaly + drift + policy flags raised simultaneously<br />
+              <strong style={{color:'#f59e0b'}}>2. Alert</strong> → Evidence report generated with MITRE classification<br />
+              <strong style={{color:'#f97316'}}>3. Isolate</strong> → Network quarantine recommended (policy engine flags device)<br />
+              <strong style={{color:'#3b82f6'}}>4. Monitor</strong> → Continued monitoring with tighter thresholds<br />
+              <strong style={{color:'#22c55e'}}>5. Restore</strong> → Trust score recovers via EMA smoothing when normal behavior resumes<br /><br />
+              <strong style={{color:'#f59e0b'}}>Demo:</strong> Each card below shows a real detection-recovery cycle from your IoT data.
+            </>} />
+
+          {/* Self-healing episodes */}
+          {healingEvents.length > 0 ? (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16, marginBottom: 16 }}>
+              {healingEvents.slice(0, 6).map((ev, i) => (
+                <div key={i} className="panel" style={{ borderLeft: '4px solid #22c55e' }}>
+                  <div className="panel-body">
+                    <div style={{ fontWeight: 700, color: '#1e293b', fontSize: 14, marginBottom: 12 }}>{ev.device} — Recovery Cycle #{i + 1}</div>
+                    {/* Timeline steps */}
+                    {[
+                      { step: '🔴 Detected',  color: '#ef4444', desc: `Trust dropped to ${ev.minScore.toFixed(1)}`, time: formatTime(ev.dropAt) },
+                      { step: '🟠 Alerted',   color: '#f97316', desc: 'Evidence report generated + MITRE tagged', time: '' },
+                      { step: '🟡 Monitoring',color: '#f59e0b', desc: 'Tighter anomaly thresholds applied', time: '' },
+                      { step: '🟢 Restored',  color: '#22c55e', desc: 'Trust recovered above 70%', time: formatTime(ev.recoveredAt) },
+                    ].map((s, si) => (
+                      <div key={si} style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: si < 3 ? 0 : 0, position: 'relative' }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                          <div style={{ width: 10, height: 10, borderRadius: '50%', background: s.color, marginTop: 3, flexShrink: 0 }} />
+                          {si < 3 && <div style={{ width: 2, height: 24, background: '#e2e8f0' }} />}
                         </div>
-                        <div style={{ height: 7, background: '#f0f0f0', borderRadius: 4, overflow: 'hidden' }}>
-                          <div style={{ height: '100%', width: `${node.risk}%`, borderRadius: 4, background: riskColor, transition: 'width 0.5s' }} />
-                        </div>
-                        <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 3 }}>
-                          {node.is_honeypot ? 'Decoy · should be 0%' : `Trust: ${node.trust}/100`}
+                        <div style={{ paddingBottom: 12 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: s.color }}>{s.step}</div>
+                          <div style={{ fontSize: 11, color: '#64748b' }}>{s.desc}</div>
+                          {s.time && <div style={{ fontSize: 10, color: '#94a3b8', fontFamily: 'monospace' }}>{s.time}</div>}
                         </div>
                       </div>
-                    );
-                  })}
-                  <div style={{ marginTop: 8, padding: 14, background: '#f8fafc', borderRadius: 10, border: '1px solid #e2e8f0' }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: '#1e293b', marginBottom: 8 }}>Propagation Model</div>
-                    <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.8 }}>
-                      Router compromise → <strong>35%</strong> risk to endpoints<br />
-                      Honeypot receives <strong>50%</strong> of router risk<br />
-                      Triggered honeypot = lateral movement confirmed<br />
-                      Each active attack adds <strong>+15%</strong> honeypot pressure
+                    ))}
+                    <div style={{ padding: '8px 12px', background: '#f0fdf4', borderRadius: 8, border: '1px solid #bbf7d0', marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: '#15803d', fontWeight: 600 }}>✓ Recovery time: ~{Math.round((new Date(ev.recoveredAt) - new Date(ev.dropAt)) / 3600000)} hours (simulated)</span>
                     </div>
                   </div>
                 </div>
+              ))}
+            </div>
+          ) : (
+            <div className="panel" style={{ marginBottom: 16 }}>
+              <div className="panel-body">
+                <div style={{ textAlign: 'center', padding: 40 }}>
+                  <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+                  <div style={{ fontWeight: 700, color: '#1e293b', fontSize: 16 }}>All Devices Stable — No Recovery Cycles Detected</div>
+                  <div style={{ color: '#64748b', fontSize: 13, marginTop: 4 }}>Trust scores have remained above threshold. Inject an attack to see self-healing in action.</div>
+                </div>
               </div>
-            ) : (
-              <div style={{ textAlign: 'center', color: '#94a3b8', padding: 40 }}>Risk map data unavailable</div>
-            )}
+            </div>
+          )}
+
+          {/* Self-healing trust chart */}
+          <div className="panel">
+            <div className="panel-header"><div><div className="panel-title">Trust Score Recovery Timeline</div><div className="panel-subtitle">EMA-smoothed trust scores — dips show attacks, recoveries show self-healing</div></div></div>
+            <div className="panel-body"><div className="chart-container">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={(() => {
+                  const byW = {};
+                  trustTl.forEach(t => {
+                    if (!byW[t.window]) byW[t.window] = { window: t.window };
+                    byW[t.window][t.device_id] = t.trust_score;
+                  });
+                  return Object.values(byW).sort((a, b) => new Date(a.window) - new Date(b.window)).slice(-60);
+                })()} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis dataKey="window" tick={{ fontSize: 9, fill: '#94a3b8' }} interval={9} tickFormatter={v => formatTime(v)} tickLine={false} />
+                  <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} width={30} />
+                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8 }} />
+                  <ReferenceLine y={60} stroke="#ef4444" strokeDasharray="4 4" label={{ value: 'Alert threshold', position: 'insideTopRight', fontSize: 10, fill: '#ef4444' }} />
+                  <ReferenceLine y={70} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: 'Recovery threshold', position: 'insideBottomRight', fontSize: 10, fill: '#f59e0b' }} />
+                  {deviceIds.map((did, i) => (
+                    <Line key={did} type="monotone" dataKey={did} name={did} stroke={Object.values(DEVICE_COLORS)[i]} strokeWidth={2} dot={false} activeDot={{ r: 3 }} />
+                  ))}
+                  <Legend verticalAlign="top" height={30} wrapperStyle={{ fontSize: 11 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div></div>
           </div>
-        </div>
+        </>
       )}
 
-      {/* ══ Self-Healing ══ */}
-      {tab === 'healing' && (
-        <div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
-            {[
-              { icon: '⚡', label: 'Auto Actions',       value: healing.filter(a => a.automated).length,             color: '#6366f1' },
-              { icon: '🚫', label: 'Threats Blocked',    value: healing.filter(a => a.action === 'BLOCK').length,    color: '#ef4444' },
-              { icon: '🔒', label: 'Devices Isolated',   value: healing.filter(a => a.action === 'ISOLATE').length,  color: '#f97316' },
-              { icon: '✅', label: 'Devices Restored',   value: healing.filter(a => a.action === 'RESTORE').length,  color: '#22c55e' },
-            ].map(s => (
-              <div key={s.label} style={{
-                background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-                padding: '16px 20px', display: 'flex', alignItems: 'center', gap: 14,
-              }}>
-                <div style={{ fontSize: 28 }}>{s.icon}</div>
-                <div>
-                  <div style={{ fontSize: 26, fontWeight: 800, color: s.color }}>{s.value}</div>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+      {/* ══════════════════════════════════════════
+          TAB: HONEYPOT
+         ══════════════════════════════════════════ */}
+      {activeTab === 'honeypot' && (
+        <>
+          <JudgeCard icon="🍯" title="IoT Honeypot Network — Attacker Intelligence"
+            what="Decoy IoT devices that attract, detect, and fingerprint attackers without exposing real assets"
+            how={<>
+              IoT honeypots are <strong style={{color:'#94d2bd'}}>fake devices</strong> that mimic real IoT hardware (cameras, routers, access controllers). Any traffic to these devices is <em>inherently suspicious</em> — no legitimate user should ever contact them.<br /><br />
+              <strong style={{color:'#94d2bd'}}>What they capture:</strong> Attacker IP addresses, attack tools, exploit payloads, reconnaissance patterns, and TTPs (Tactics, Techniques, Procedures).<br /><br />
+              <strong style={{color:'#94d2bd'}}>Integration:</strong> Honeypot events feed back into our trust engine — a device contacting a honeypot gets immediate trust penalty and triggers manual review.<br /><br />
+              <strong style={{color:'#f59e0b'}}>Demo:</strong> Below are deployed honeypot devices and intelligence captured from the live network monitor.
+            </>} />
+
+          {/* Honeypot device cards */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16, marginBottom: 16 }}>
+            {honeypotDevices.map((hp, i) => (
+              <div key={i} className="panel" style={{ borderTop: '4px solid #f59e0b', position: 'relative' }}>
+                <div style={{ position: 'absolute', top: 12, right: 12 }}>
+                  <span style={{ fontSize: 10, background: '#fef9c3', color: '#d97706', padding: '2px 8px', borderRadius: 20, fontWeight: 700, border: '1px solid #fde68a' }}>
+                    🍯 HONEYPOT
+                  </span>
+                </div>
+                <div className="panel-body">
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>{i === 0 ? '📷' : i === 1 ? '🌐' : '🔐'}</div>
+                  <div style={{ fontWeight: 700, color: '#1e293b', fontSize: 15 }}>{hp.id}</div>
+                  <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>{hp.type}</div>
+                  <div style={{ fontSize: 12, color: '#334155', marginBottom: 12, lineHeight: 1.5 }}>{hp.role}</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', background: hp.caught > 0 ? '#fef2f2' : '#f0fdf4', borderRadius: 8, border: `1px solid ${hp.caught > 0 ? '#fecaca' : '#bbf7d0'}` }}>
+                    <span style={{ fontSize: 12, color: hp.caught > 0 ? '#ef4444' : '#22c55e', fontWeight: 600 }}>
+                      {hp.caught > 0 ? `⚠ ${hp.caught} contacts detected` : '✓ No contacts — clean'}
+                    </span>
+                    <span style={{ fontSize: 10, background: hp.status === 'active' ? '#dcfce7' : '#f1f5f9', color: hp.status === 'active' ? '#15803d' : '#64748b', padding: '2px 8px', borderRadius: 4, fontWeight: 600 }}>
+                      {hp.status.toUpperCase()}
+                    </span>
+                  </div>
                 </div>
               </div>
             ))}
           </div>
-          <div className="panel">
-            <div className="panel-header">
-              <div>
-                <div className="panel-title">Autonomous Response Console</div>
-                <div className="panel-subtitle">
-                  Real-time self-healing actions — automated threat containment and remediation
-                </div>
-              </div>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                background: '#f0fdf4', border: '1px solid #bbf7d0',
-                borderRadius: 8, padding: '5px 14px', fontSize: 11, fontWeight: 700, color: '#16a34a',
-              }}>
-                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
-                Engine Active
-              </div>
-            </div>
-            <div className="panel-body">
-              <HealingConsole actions={healing} />
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* ══ Honeypot ══ */}
-      {tab === 'honeypot' && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-          <HoneypotPanel honeypot={honeypot} />
-          <div>
-            <div className="panel" style={{ marginBottom: 16 }}>
-              <div className="panel-header">
-                <div>
-                  <div className="panel-title">How It Works</div>
-                  <div className="panel-subtitle">Deception-based threat detection</div>
-                </div>
-              </div>
-              <div className="panel-body">
-                <div style={{ fontSize: 12, color: '#64748b', lineHeight: 2 }}>
-                  {[
-                    ['🎭 Digital Decoy',   'A fake IoT node (192.168.1.99) is embedded in the network topology but runs no real services.'],
-                    ['📡 Zero Traffic',    'Under normal operation, no device should ever communicate with the honeypot IP.'],
-                    ['🔍 Lure Detection',  'Any packet to the honeypot indicates an attacker scanning or moving laterally.'],
-                    ['⚡ Instant Alert',   'Detection triggers immediate risk elevation and self-healing isolation sequence.'],
-                    ['🧬 Attribution',     'Source device and protocol reveal the attack vector and patient-zero device.'],
-                  ].map(([title, desc]) => (
-                    <div key={title} style={{ marginBottom: 12, display: 'flex', gap: 10 }}>
-                      <span style={{ fontWeight: 700, color: '#1e293b', minWidth: 130 }}>{title}</span>
-                      <span>{desc}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
+          {/* Unknown IPs detected (honeypot catches) */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
             <div className="panel">
               <div className="panel-header">
-                <div>
-                  <div className="panel-title">Digital Twin Comparison</div>
-                  <div className="panel-subtitle">Expected vs actual device behavior</div>
-                </div>
+                <div><div className="panel-title">Honeypot Catches</div><div className="panel-subtitle">Unknown IPs detected contacting our IoT devices</div></div>
+                <span className="live-badge" style={{ background: unknownIps.length > 0 ? '#fee2e2' : '#dcfce7', color: unknownIps.length > 0 ? '#ef4444' : '#22c55e' }}>
+                  {unknownIps.length} IPs
+                </span>
               </div>
-              <div className="panel-body">
-                {fingerprints.slice(0, 2).map(fp => {
-                  const color = SEV_COLOR[fp.severity] || '#22c55e';
-                  const topDev = fp.dimensions.reduce((a, d) => {
-                    const delta = (fp.current[d] ?? 0) - (fp.baseline[d] ?? 0);
-                    return delta > (a.delta ?? 0) ? { dim: d, delta } : a;
-                  }, { dim: null, delta: 0 });
-                  return (
-                    <div key={fp.device_id} style={{ marginBottom: 16, padding: 14, background: '#f8fafc', borderRadius: 10, border: '1px solid #e2e8f0' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                        <span style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{fp.device_id}</span>
-                        <span style={{ fontSize: 11, color: color, fontWeight: 700 }}>{fp.severity}</span>
-                      </div>
-                      <div style={{ fontSize: 11, color: '#64748b' }}>
-                        Digital twin deviation: <strong style={{ color }}>
-                          {topDev.dim ? `+${topDev.delta.toFixed(0)}% on ${topDev.dim}` : 'Within normal range'}
-                        </strong>
-                      </div>
-                      <div style={{ marginTop: 8, height: 4, background: '#e2e8f0', borderRadius: 2, overflow: 'hidden' }}>
-                        <div style={{
-                          height: '100%', borderRadius: 2, background: color,
-                          width: `${Math.min(100, Math.abs(topDev.delta))}%`, transition: 'width 0.5s',
-                        }} />
-                      </div>
-                    </div>
-                  );
-                })}
+              <div className="panel-body no-padding" style={{ maxHeight: 300, overflowY: 'auto' }}>
+                {unknownIps.length === 0 ? (
+                  <div className="table-empty">No unknown IPs caught yet. Start IoT simulation to see catches.</div>
+                ) : (
+                  <table className="alerts-table">
+                    <thead><tr><th>IP Address</th><th>Target Device</th><th>Tick</th></tr></thead>
+                    <tbody>
+                      {unknownIps.slice(-20).reverse().map((u, i) => (
+                        <tr key={i}>
+                          <td style={{ fontFamily: 'monospace', fontWeight: 600, color: '#ef4444' }}>{u.ip}</td>
+                          <td>{u.device_id}</td>
+                          <td style={{ color: '#94a3b8', fontSize: 11 }}>T+{u.tick}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
               </div>
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* ══ Policy ══ */}
-      {tab === 'policy' && (
-        <>
-      <div className="stats-bar">
-            {policyData.summary.map(s => {
-          const rateClass = s.hard_violation > 0 ? 'bad' : s.soft_drift > 0 ? 'warn' : 'good';
-          return (
-            <div key={s.device_id} className="compliance-card">
-              <div className="compliance-device-name">{s.device_id}</div>
-              <div className="compliance-type">{s.device_type}</div>
-              <div className={`compliance-rate ${rateClass}`}>{s.compliance_rate}%</div>
-              <div className="compliance-bar-track">
-                <div className={`compliance-bar-fill ${rateClass}`} style={{ width: `${s.compliance_rate}%` }} />
-              </div>
-              <div className="compliance-detail">
-                <span><span className="dot-green" /> {s.compliant} OK</span>
-                <span><span className="dot-yellow" /> {s.soft_drift} Drift</span>
-                <span><span className="dot-red" /> {s.hard_violation} Violation</span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="two-col-grid">
-        <div className="panel">
-              <div className="panel-header"><div>
-              <div className="panel-title">Compliance Rate by Device</div>
-              <div className="panel-subtitle">Percentage of compliant hourly windows</div>
-              </div></div>
-          <div className="panel-body">
-            <div className="chart-container small">
-              <ResponsiveContainer width="100%" height="100%">
-                    <BarChart
-                      data={policyData.summary.map(s => ({
-                        device: s.device_id, compliance: s.compliance_rate,
-                        hv: s.hard_violation > 0, sd: s.soft_drift > 0,
-                      }))}
-                      margin={{ top: 10, right: 20, left: 0, bottom: 0 }}
-                    >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis dataKey="device" tick={{ fontSize: 11, fill: '#64748b' }} tickLine={false} />
-                  <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#94a3b8' }} tickLine={false} width={35} tickFormatter={v => `${v}%`} />
-                      <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} formatter={v => `${v}%`} />
-                      <Bar dataKey="compliance" radius={[6, 6, 0, 0]}>
-                        {policyData.summary.map((d, i) => (
-                          <Cell key={i} fill={d.hard_violation > 0 ? '#ef4444' : d.soft_drift > 0 ? '#f59e0b' : '#22c55e'} />
+            {/* Attack catalog as honeypot intelligence */}
+            <div className="panel">
+              <div className="panel-header"><div><div className="panel-title">Honeypot Intelligence</div><div className="panel-subtitle">Attack TTPs our honeypots are configured to detect</div></div></div>
+              <div className="panel-body no-padding" style={{ maxHeight: 300, overflowY: 'auto' }}>
+                <table className="alerts-table">
+                  <thead><tr><th>Attack TTP</th><th>Target Type</th><th>MITRE</th></tr></thead>
+                  <tbody>
+                    {[
+                      { name: 'Video Exfiltration', device: 'CCTV', mitre: 'T1041', icon: '📤' },
+                      { name: 'C2 via SSH', device: 'CCTV', mitre: 'T1071', icon: '📡' },
+                      { name: 'DNS Tunneling', device: 'Router', mitre: 'T1572', icon: '🌐' },
+                      { name: 'Lateral Scan', device: 'Router', mitre: 'T1046', icon: '↔️' },
+                      { name: 'Credential Stuffing', device: 'Access', mitre: 'T1110', icon: '🔑' },
+                      { name: 'Data Exfil via HTTPS', device: 'Access', mitre: 'T1048', icon: '📤' },
+                    ].map((t, i) => (
+                      <tr key={i}>
+                        <td style={{ fontWeight: 600 }}>{t.icon} {t.name}</td>
+                        <td><span style={{ fontSize: 11, background: '#f1f5f9', padding: '2px 8px', borderRadius: 4 }}>{t.device}</span></td>
+                        <td style={{ fontFamily: 'monospace', fontSize: 11, color: '#3b82f6' }}>{t.mitre}</td>
+                      </tr>
                     ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
-        </div>
-
-        <div className="panel">
-              <div className="panel-header"><div>
-              <div className="panel-title">Policy Status Distribution</div>
-                <div className="panel-subtitle">Overall policy evaluation breakdown</div>
-              </div></div>
-          <div className="panel-body">
-            <div className="chart-container small">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                      <Pie data={pieData} dataKey="count" nameKey="status"
-                        cx="50%" cy="50%" innerRadius={55} outerRadius={90} paddingAngle={3}
-                    label={({ status, count }) => `${status.replace('_', ' ')}: ${count}`}
-                    style={{ fontSize: 11 }}
-                  >
-                        {pieData.map((p, i) => <Cell key={i} fill={STATUS_COLORS[p.status] || '#94a3b8'} />)}
-                  </Pie>
-                      <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8 }} />
-                  <Legend verticalAlign="bottom" height={30} wrapperStyle={{ fontSize: 11 }} />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="panel">
-            <div className="panel-header"><div>
-              <div className="panel-title">Violations Log</div>
-              <div className="panel-subtitle">All non-compliant evaluations with details</div>
-            </div></div>
-        <div className="panel-body no-padding" style={{ paddingTop: 0 }}>
-          {violations.length === 0 ? (
-                <div className="table-empty">No violations found</div>
-          ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <table className="data-table">
-                <thead>
-                  <tr>
-                        <th>Time</th><th>Device</th><th>Type</th>
-                        <th>Status</th><th>Violations</th><th>Penalty</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {violations.map((v, i) => (
-                    <tr key={i}>
-                          <td className="table-cell-time">{new Date(v.window).toLocaleString()}</td>
-                      <td className="table-cell-device">{v.device_id}</td>
-                      <td style={{ fontSize: 12, color: '#64748b' }}>{v.device_type}</td>
-                      <td>
-                            <span className={`severity-badge ${v.policy_status === 'HARD_VIOLATION' ? 'high' : 'medium'}`}>
-                          {v.policy_status.replace('_', ' ')}
-                        </span>
-                      </td>
-                      <td style={{ fontSize: 12, maxWidth: 300 }}>{v.violations}</td>
-                          <td style={{ fontWeight: 600, color: v.penalty >= 25 ? '#ef4444' : '#f59e0b' }}>
-                            -{v.penalty}
-                          </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
         </>
       )}
     </>

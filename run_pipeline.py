@@ -58,30 +58,19 @@ def run_pipeline():
     from ml_engine.drift_detector import compute_drift, DRIFT_NONE
 
     drift_results = []
-    prev_rows: dict = {}   # track last row per device for temporal drift
     for _, row in full.iterrows():
         device_id = row["device_id"]
         window = str(row["window"])
         if device_id not in baseline_stats:
             continue
-        result = compute_drift(
-            device_id,
-            window,
-            row.to_dict(),
-            baseline_stats[device_id],
-            prev_row=prev_rows.get(device_id),   # ← enables temporal drift
-        )
-        prev_rows[device_id] = row.to_dict()     # store for next window
+        result = compute_drift(device_id, window, row.to_dict(), baseline_stats[device_id])
         drift_results.append({
-            "device_id":         result.device_id,
-            "window":            result.window_start,
-            "drift_magnitude":   result.drift_magnitude,
-            "drift_class":       result.drift_class,
-            "statistical_score": result.statistical_score,
-            "behavioral_score":  result.behavioral_score,
-            "temporal_score":    result.temporal_score,
-            "top_drifters":      str(result.top_drifters),
-            "penalty":           result.penalty,
+            "device_id": result.device_id,
+            "window": result.window_start,
+            "drift_magnitude": result.drift_magnitude,
+            "drift_class": result.drift_class,
+            "top_drifters": str(result.top_drifters),
+            "penalty": result.penalty,
         })
 
     drift_df = pd.DataFrame(drift_results)
@@ -153,38 +142,6 @@ def run_pipeline():
     from explainability.evidence_generator import generate_evidence_reports
     evidence_df = generate_evidence_reports()
 
-    # ---- Stage 6: Detection Metrics (time-to-detection) ----
-    print("[STAGE 6/6] Detection Metrics")
-    print("-" * 60)
-    try:
-        raw_df = pd.read_csv(os.path.join(DATA_DIR, "full_dataset.csv"), parse_dates=["timestamp"])
-        attacks_raw = raw_df[raw_df["label"] != "normal"]
-        evidence_df["window"] = pd.to_datetime(evidence_df["window"])
-        flagged_ev  = evidence_df[evidence_df["severity_smoothed"] != "Low"]
-
-        metrics = {"computed_at": pd.Timestamp.now().isoformat()}
-        if not attacks_raw.empty and not flagged_ev.empty:
-            first_attack    = attacks_raw["timestamp"].min()
-            first_detection = flagged_ev["window"].min()
-            ttd_mins = (first_detection - first_attack).total_seconds() / 60
-            metrics["detection_time_mins"] = round(ttd_mins, 1)
-            metrics["first_attack_at"]     = first_attack.isoformat()
-            metrics["first_detection_at"]  = first_detection.isoformat()
-            metrics["status"] = "early" if ttd_mins < 60 else "delayed"
-            print(f"  -> Time-to-detection: {ttd_mins:.1f} min ({metrics['status']})")
-        else:
-            metrics["detection_time_mins"] = None
-            metrics["status"] = "no_attacks"
-            print(f"  -> No attacks in dataset — baseline run")
-
-        import json as _json
-        with open(os.path.join(DATA_DIR, "detection_metrics.json"), "w") as _f:
-            _json.dump(metrics, _f, indent=2)
-        print(f"  -> Saved: detection_metrics.json")
-    except Exception as e:
-        print(f"  -> Skipped (error: {e})")
-    print()
-
     # ---- Final Summary ----
     elapsed = time.time() - start
     print()
@@ -202,12 +159,11 @@ def run_pipeline():
     print(f"  High/Crit:  {len(flagged)}")
     print()
     print("  Output files in data/:")
-    print("    anomaly_scores.csv  (includes confidence column)")
+    print("    anomaly_scores.csv")
     print("    drift_results.csv")
     print("    policy_results.csv")
     print("    trust_scores.csv")
     print("    evidence_reports.csv")
-    print("    detection_metrics.json")
     print("=" * 60)
 
 

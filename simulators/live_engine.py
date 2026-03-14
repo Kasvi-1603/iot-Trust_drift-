@@ -511,9 +511,8 @@ class LiveEngine:
         self.running = True
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        # Generate first tick immediately
-        self._tick()
         print(f"[LiveEngine] Started — generating data every {tick_interval}s")
+        # First tick runs automatically in the background thread — don't block here
 
     def stop(self):
         """Stop live data generation."""
@@ -536,8 +535,8 @@ class LiveEngine:
                 "device_type": device_type,
                 "started_tick": self.tick_count,
             }
-        # Generate a tick immediately so the effect is visible
-        self._tick()
+        # Schedule tick in background thread so we don't block the caller
+        threading.Thread(target=self._tick, daemon=True).start()
         return {"device_id": device_id, "attack_type": attack_type, "attack_name": attack_name}
 
     def clear_attack(self, device_id):
@@ -545,7 +544,7 @@ class LiveEngine:
         with self._lock:
             if device_id in self.active_attacks:
                 del self.active_attacks[device_id]
-        self._tick()
+        threading.Thread(target=self._tick, daemon=True).start()
 
     def reset(self):
         """Clear everything — stop all attacks, clear history."""
@@ -558,24 +557,27 @@ class LiveEngine:
             self.ema_state = {}
             self.current_time = datetime(2024, 1, 15, 0, 0, 0)
             self.tick_count = 0
-        # Generate first tick
-        self._tick()
+        threading.Thread(target=self._tick, daemon=True).start()
 
     # ── Data Access ──
+
+    def _get_latest_nolock(self):
+        """Get latest window per device — caller must hold self._lock."""
+        if not self.windows:
+            return {}
+        latest = {}
+        for w in reversed(self.windows):
+            did = w["device_id"]
+            if did not in latest:
+                latest[did] = w
+            if len(latest) >= 3:
+                break
+        return latest
 
     def get_latest(self):
         """Get latest window per device."""
         with self._lock:
-            if not self.windows:
-                return {}
-            latest = {}
-            for w in reversed(self.windows):
-                did = w["device_id"]
-                if did not in latest:
-                    latest[did] = w
-                if len(latest) >= 3:
-                    break
-            return latest
+            return self._get_latest_nolock()
 
     def get_timeline(self, last_n=100):
         """Get last N windows."""
@@ -583,15 +585,19 @@ class LiveEngine:
             return list(self.windows[-last_n:])
 
     def get_live_stats(self):
-        """Get summary stats for the live dashboard."""
+        """Get summary stats for the live dashboard — no deadlock."""
         with self._lock:
-            latest = self.get_latest()
+            # Use nolock version since we already hold the lock
+            latest = self._get_latest_nolock()
             if not latest:
                 return {
-                    "tick_count": 0,
+                    "tick_count": self.tick_count,
                     "running": self.running,
                     "devices": [],
-                    "active_attacks": {},
+                    "active_attacks": dict(self.active_attacks),
+                    "total_anomalous": len(self.anomalous_windows),
+                    "total_unknown_ips": len(self.unknown_ips_detected),
+                    "total_violations": len(self.protocol_violations),
                 }
 
             devices = []

@@ -37,9 +37,10 @@ function formatTime(iso) {
 }
 
 /* ── Device Card with Attack Injection ── */
-function DeviceCard({ device, catalog, activeInjections, onInject, onNavigate, injecting }) {
+function DeviceCard({ device, catalog, activeInjections, onInject, onReset, onNavigate, injecting }) {
   const [selectedAttack, setSelectedAttack] = useState('');
   const [isInjecting, setIsInjecting] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const sev = severityClass(device.severity);
 
   // Get device type for catalog lookup
@@ -59,6 +60,13 @@ function DeviceCard({ device, catalog, activeInjections, onInject, onNavigate, i
     await onInject(device.device_id, selectedAttack);
     setIsInjecting(false);
     setSelectedAttack('');
+  };
+
+  const handleResetDevice = async () => {
+    if (isResetting) return;
+    setIsResetting(true);
+    await onReset(device.device_id);
+    setIsResetting(false);
   };
 
   return (
@@ -98,14 +106,35 @@ function DeviceCard({ device, catalog, activeInjections, onInject, onNavigate, i
         </div>
       )}
 
-      {/* Attack Injection Dropdown */}
-      {attacks.length > 0 && !activeAttack && (
+      {/* Per-Device Reset Button — show if active injection OR device is compromised */}
+      {(activeAttack || device.severity === 'Critical' || device.severity === 'High' || device.trust_score < 50) && (
+        <button
+          className="device-reset-btn"
+          disabled={isResetting || injecting}
+          onClick={handleResetDevice}
+        >
+          {isResetting ? (
+            <><span className="mini-spinner" /> Removing...</>
+          ) : (
+            <>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                <path d="M3 3v5h5"/>
+              </svg>
+              Reset Attack
+            </>
+          )}
+        </button>
+      )}
+
+      {/* Attack Injection Dropdown — always shown so you can stack/change attacks */}
+      {attacks.length > 0 && (
         <div className="device-inject-section">
           <div className="device-inject-label">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
             </svg>
-            Simulate Attack
+            {activeAttack ? 'Inject Another Attack' : 'Simulate Attack'}
           </div>
           <div className="device-inject-row">
             <select
@@ -188,10 +217,6 @@ function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  /* ── System status + detection metrics ── */
-  const [systemStatus, setSystemStatus] = useState(null);
-  const [detectionMetrics, setDetectionMetrics] = useState(null);
-
   /* ── Attack injection state ── */
   const [catalog, setCatalog] = useState({});
   const [activeInjections, setActiveInjections] = useState({});
@@ -201,48 +226,32 @@ function Dashboard() {
   const navigate = useNavigate();
 
   const fetchDashboardData = useCallback(async () => {
-    // Use allSettled so one slow/failing endpoint never blocks the whole dashboard
-    const safe = (promise) => promise.catch(() => ({ data: null }));
     try {
-      const [devRes, tlRes, alRes, stRes, catRes, injRes, sysRes, dtRes] = await Promise.all([
-        safe(axios.get(`${API}/devices`)),
-        safe(axios.get(`${API}/trust-timeline`)),
-        safe(axios.get(`${API}/alerts`)),
-        safe(axios.get(`${API}/stats`)),
-        safe(axios.get(`${API}/attack-catalog`)),
-        safe(axios.get(`${API}/injection-status`)),
-        safe(axios.get(`${API}/system-status`)),
-        safe(axios.get(`${API}/detection-metrics`)),
+      const [devRes, tlRes, alRes, stRes, catRes, injRes] = await Promise.all([
+        axios.get(`${API}/devices`),
+        axios.get(`${API}/trust-timeline`),
+        axios.get(`${API}/alerts`),
+        axios.get(`${API}/stats`),
+        axios.get(`${API}/attack-catalog`),
+        axios.get(`${API}/injection-status`),
       ]);
+      setDevices(devRes.data);
+      setStats(stRes.data);
+      setCatalog(catRes.data);
+      setActiveInjections(injRes.data.active_injections || {});
 
-      if (!devRes.data && !stRes.data) {
-        // Core endpoints both failed — backend is down
-        setError('Failed to connect to API. Make sure the FastAPI server is running on port 8002.');
-        setLoading(false);
-        return;
-      }
-
-      if (devRes.data)  setDevices(devRes.data);
-      if (stRes.data)   setStats(stRes.data);
-      if (catRes.data)  setCatalog(catRes.data);
-      if (injRes.data)  setActiveInjections(injRes.data.active_injections || {});
-      if (sysRes.data)  setSystemStatus(sysRes.data);
-      if (dtRes.data)   setDetectionMetrics(dtRes.data);
-
-      if (tlRes.data) {
-        const byWindow = {};
-        tlRes.data.forEach((row) => {
-          const t = formatTime(row.window);
-          if (!byWindow[t]) byWindow[t] = { window: t };
-          byWindow[t][row.device_id] = row.trust_score;
-        });
-        setTimeline(Object.values(byWindow));
-      }
-      if (alRes.data) setAlerts(alRes.data.slice(0, 15));
+      const byWindow = {};
+      tlRes.data.forEach((row) => {
+        const t = formatTime(row.window);
+        if (!byWindow[t]) byWindow[t] = { window: t };
+        byWindow[t][row.device_id] = row.trust_score;
+      });
+      setTimeline(Object.values(byWindow));
+      setAlerts(alRes.data.slice(0, 15));
       setLoading(false);
     } catch (err) {
       console.error(err);
-      setError('Failed to connect to API. Make sure the FastAPI server is running on port 8002.');
+      setError('Failed to connect to API. Make sure the FastAPI server is running on port 8001.');
       setLoading(false);
     }
   }, []);
@@ -285,6 +294,19 @@ function Dashboard() {
     setInjecting(false);
   }
 
+  async function handleResetDevice(deviceId) {
+    setInjecting(true);
+    try {
+      const res = await axios.post(`${API}/reset-device/${deviceId}`);
+      setActiveInjections(res.data.active_injections || {});
+      if (lastInjection?.device_id === deviceId) setLastInjection(null);
+      await fetchDashboardData();
+    } catch (err) {
+      console.error('Device reset failed:', err);
+    }
+    setInjecting(false);
+  }
+
   if (loading) {
     return <div className="loading-container"><div className="loading-spinner" /><div className="loading-text">Loading dashboard...</div></div>;
   }
@@ -318,25 +340,23 @@ function Dashboard() {
         </div>
 
         <div className="sim-panel-right" style={{ flexWrap: 'wrap', gap: 8 }}>
-          {hasActiveAttack && (
-            <button
-              className="sim-btn sim-btn-reset-glow"
-              disabled={injecting}
-              onClick={handleReset}
-            >
-              {injecting ? (
-                <><span className="mini-spinner" /> Resetting...</>
-              ) : (
-                <>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-                    <path d="M3 3v5h5"/>
-                  </svg>
-                  Reset to Clean Baseline
-                </>
-              )}
-            </button>
-          )}
+          <button
+            className={`sim-btn ${hasActiveAttack ? 'sim-btn-reset-glow' : 'sim-btn-reset'}`}
+            disabled={injecting}
+            onClick={handleReset}
+          >
+            {injecting ? (
+              <><span className="mini-spinner" /> Resetting...</>
+            ) : (
+              <>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                  <path d="M3 3v5h5"/>
+                </svg>
+                Reset to Clean Baseline
+              </>
+            )}
+          </button>
         </div>
 
         {injecting && (
@@ -379,88 +399,6 @@ function Dashboard() {
         </div>
       )}
 
-      {/* ── Auto-Decision Banner ── */}
-      {systemStatus && (
-        <div style={{
-          display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap',
-        }}>
-          {/* Overall system verdict */}
-          <div style={{
-            flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 12,
-            padding: '14px 22px', borderRadius: 14, fontFamily: 'inherit',
-            background: systemStatus.overall === 'UNSAFE' ? '#fef2f2'
-                       : systemStatus.overall === 'WATCH'  ? '#fffbeb' : '#f0fdf4',
-            border: `2px solid ${systemStatus.overall === 'UNSAFE' ? '#fca5a5'
-                                : systemStatus.overall === 'WATCH'  ? '#fde68a' : '#86efac'}`,
-          }}>
-            <span style={{ fontSize: 28 }}>
-              {systemStatus.overall === 'UNSAFE' ? '🔴' : systemStatus.overall === 'WATCH' ? '🟡' : '🟢'}
-            </span>
-            <div>
-              <div style={{
-                fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase',
-                color: systemStatus.overall === 'UNSAFE' ? '#dc2626'
-                     : systemStatus.overall === 'WATCH'  ? '#d97706' : '#16a34a',
-              }}>Network Status</div>
-              <div style={{
-                fontSize: 22, fontWeight: 800,
-                color: systemStatus.overall === 'UNSAFE' ? '#dc2626'
-                     : systemStatus.overall === 'WATCH'  ? '#d97706' : '#16a34a',
-              }}>{systemStatus.overall}</div>
-            </div>
-          </div>
-
-          {/* Per-device verdicts */}
-          {systemStatus.devices.map(d => (
-            <div key={d.device_id} style={{
-              flex: '1 1 0', minWidth: 150,
-              padding: '12px 16px', borderRadius: 14,
-              background: d.status === 'UNSAFE' ? '#fef2f2' : d.status === 'WATCH' ? '#fffbeb' : '#f0fdf4',
-              border: `1.5px solid ${d.status === 'UNSAFE' ? '#fca5a5' : d.status === 'WATCH' ? '#fde68a' : '#86efac'}`,
-            }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#94a3b8', marginBottom: 2 }}>{d.device_id}</div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <span style={{ fontSize: 16 }}>
-                  {d.status === 'UNSAFE' ? '🔴' : d.status === 'WATCH' ? '🟡' : '🟢'}
-                </span>
-                <span style={{
-                  fontSize: 15, fontWeight: 800,
-                  color: d.status === 'UNSAFE' ? '#dc2626' : d.status === 'WATCH' ? '#d97706' : '#16a34a',
-                }}>{d.status}</span>
-              </div>
-              <div style={{ fontSize: 10, color: '#64748b', marginTop: 4 }}>{d.reason}</div>
-            </div>
-          ))}
-
-          {/* Time-to-detection */}
-          {detectionMetrics && detectionMetrics.detection_time_mins != null && (
-            <div style={{
-              flex: '0 0 auto', padding: '12px 20px', borderRadius: 14,
-              background: detectionMetrics.status === 'early' ? '#eff6ff' : '#fff7ed',
-              border: `1.5px solid ${detectionMetrics.status === 'early' ? '#bfdbfe' : '#fed7aa'}`,
-            }}>
-              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1, textTransform: 'uppercase', color: '#94a3b8', marginBottom: 4 }}>
-                ⏱ Time-to-Detection
-              </div>
-              <div style={{
-                fontSize: 26, fontWeight: 800,
-                color: detectionMetrics.status === 'early' ? '#2563eb' : '#ea580c',
-              }}>
-                {detectionMetrics.detection_time_mins < 1
-                  ? `<1 min`
-                  : `${detectionMetrics.detection_time_mins} min`}
-              </div>
-              <div style={{
-                fontSize: 10, fontWeight: 600, marginTop: 2,
-                color: detectionMetrics.status === 'early' ? '#3b82f6' : '#f97316',
-              }}>
-                {detectionMetrics.status === 'early' ? '✓ Early detection' : '⚠ Delayed detection'}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
       {/* Stats Bar */}
       {stats && (
         <div className="stats-bar">
@@ -496,6 +434,7 @@ function Dashboard() {
             catalog={catalog}
             activeInjections={activeInjections}
             onInject={handleInject}
+            onReset={handleResetDevice}
             onNavigate={() => navigate(`/device/${d.device_id}`)}
             injecting={injecting}
           />

@@ -139,12 +139,6 @@ def score_all_devices(models, all_features):
     mx = results_df["raw_score"].max()
     results_df["anomaly_score"] = 1 - (results_df["raw_score"] - mn) / (mx - mn + 1e-10)
 
-    # Confidence = how far from the decision boundary (|raw_score| normalised to 0-100)
-    # High confidence -> clearly normal OR clearly anomalous
-    # Low confidence  -> borderline / uncertain
-    max_abs = results_df["raw_score"].abs().max() + 1e-10
-    results_df["confidence"] = (results_df["raw_score"].abs() / max_abs * 100).round(1)
-
     return results_df
 
 
