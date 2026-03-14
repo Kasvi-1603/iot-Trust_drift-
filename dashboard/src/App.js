@@ -8,6 +8,13 @@ import Alerts from './pages/Alerts';
 import Security from './pages/Security';
 import Devices from './pages/Devices';
 import DeviceDetail from './pages/DeviceDetail';
+import PhoneDevices from './components/PhoneDevices';
+
+// Add inside your layout:
+<PhoneDevices backendUrl="http://localhost:5000" />
+
+// For deployed version, use env var:
+// <PhoneDevices backendUrl={process.env.REACT_APP_BACKEND_URL} />
 
 /* SVG Icons as components */
 const IconDashboard = () => (
