@@ -47,8 +47,6 @@ Access_01,AccessController,2024-01-16 20:00:00,COMPLIANT,none,0
 Access_01,AccessController,2024-01-16 21:00:00,COMPLIANT,none,0
 Access_01,AccessController,2024-01-16 22:00:00,COMPLIANT,none,0
 Access_01,AccessController,2024-01-16 23:00:00,COMPLIANT,none,0
-Access_01,AccessController,2024-01-17 00:00:00,COMPLIANT,none,0
-Access_01,AccessController,2024-01-17 01:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-15 00:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-15 01:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-15 02:00:00,COMPLIANT,none,0
@@ -97,8 +95,6 @@ CCTV_01,CCTV,2024-01-16 20:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-16 21:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-16 22:00:00,COMPLIANT,none,0
 CCTV_01,CCTV,2024-01-16 23:00:00,COMPLIANT,none,0
-CCTV_01,CCTV,2024-01-17 00:00:00,HARD_VIOLATION,"Unauthorized protocol(s): {'HTTPS', 'SSH'}. Allowed: {'RTSP'}; Unauthorized port(s): {443, 22}. Allowed: {554}; Unknown destination(s): {'198.51.100.25', '192.0.2.100', '203.0.113.50'}; Volume violation: 51016749 bytes exceeds limit 22500000 (2.3x)",40
-CCTV_01,CCTV,2024-01-17 01:00:00,HARD_VIOLATION,"Unauthorized protocol(s): {'HTTPS', 'SSH'}. Allowed: {'RTSP'}; Unauthorized port(s): {443, 22}. Allowed: {554}; Unknown destination(s): {'198.51.100.25', '192.0.2.100', '203.0.113.50'}; Volume violation: 51468829 bytes exceeds limit 22500000 (2.3x)",40
 Router_01,Router,2024-01-15 00:00:00,COMPLIANT,none,0
 Router_01,Router,2024-01-15 01:00:00,COMPLIANT,none,0
 Router_01,Router,2024-01-15 02:00:00,COMPLIANT,none,0
@@ -147,5 +143,3 @@ Router_01,Router,2024-01-16 20:00:00,COMPLIANT,none,0
 Router_01,Router,2024-01-16 21:00:00,COMPLIANT,none,0
 Router_01,Router,2024-01-16 22:00:00,COMPLIANT,none,0
 Router_01,Router,2024-01-16 23:00:00,COMPLIANT,none,0
-Router_01,Router,2024-01-17 00:00:00,HARD_VIOLATION,"Unauthorized protocol(s): {'TCP'}. Allowed: {'DNS'}; Unauthorized port(s): {8080, 80, 22, 443, 3389, 445}. Allowed: {53}; Unexpected traffic direction(s): {'internal'}",40
-Router_01,Router,2024-01-17 01:00:00,HARD_VIOLATION,"Unauthorized protocol(s): {'TCP'}. Allowed: {'DNS'}; Unauthorized port(s): {8080, 80, 22, 443, 3389, 445}. Allowed: {53}; Unexpected traffic direction(s): {'internal'}",40

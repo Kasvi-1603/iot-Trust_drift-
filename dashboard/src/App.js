@@ -9,12 +9,7 @@ import Security from './pages/Security';
 import Devices from './pages/Devices';
 import DeviceDetail from './pages/DeviceDetail';
 import PhoneDevices from './components/PhoneDevices';
-
-// Add inside your layout:
-<PhoneDevices backendUrl="http://localhost:5000" />
-
-// For deployed version, use env var:
-// <PhoneDevices backendUrl={process.env.REACT_APP_BACKEND_URL} />
+import Profiler from './pages/Profiler';
 
 /* SVG Icons as components */
 const IconDashboard = () => (
@@ -55,6 +50,12 @@ const IconDevices = () => (
   </svg>
 );
 
+const IconProfiler = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
+  </svg>
+);
+
 const IconLogout = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
@@ -64,12 +65,16 @@ const IconLogout = () => (
 function Sidebar() {
   const navigate = useNavigate();
 
-  const links = [
+  const monitorLinks = [
     { to: '/', label: 'Dashboard', icon: <IconDashboard /> },
     { to: '/devices', label: 'Devices', icon: <IconDevices /> },
-    { to: '/analytics', label: 'Analytics', icon: <IconAnalytics /> },
+    { to: '/profiler', label: 'Device Profiler', icon: <IconProfiler /> },
+    { to: '/analytics', label: 'Visualization', icon: <IconAnalytics /> },
     { to: '/network', label: 'Network', icon: <IconNetwork /> },
     { to: '/alerts', label: 'Alerts', icon: <IconAlerts /> },
+  ];
+
+  const respondLinks = [
     { to: '/security', label: 'Security', icon: <IconSecurity /> },
   ];
 
@@ -89,7 +94,7 @@ function Sidebar() {
 
       <nav className="sidebar-nav">
         <div className="sidebar-section-label">Monitor</div>
-        {links.slice(0, 4).map(link => (
+        {monitorLinks.map(link => (
           <NavLink
             key={link.to}
             to={link.to}
@@ -102,7 +107,7 @@ function Sidebar() {
         ))}
 
         <div className="sidebar-section-label" style={{ marginTop: 8 }}>Respond</div>
-        {links.slice(4).map(link => (
+        {respondLinks.map(link => (
           <NavLink
             key={link.to}
             to={link.to}
@@ -154,6 +159,7 @@ function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/" element={<Dashboard />} />
           <Route path="/devices" element={<Devices />} />
+          <Route path="/profiler" element={<Profiler />} />
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/network" element={<Network />} />
           <Route path="/alerts" element={<Alerts />} />
