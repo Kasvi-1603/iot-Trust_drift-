@@ -1,0 +1,38 @@
+{
+  "total_bytes_out": {
+    "mean": 3215971.652777778,
+    "std": 4344389.278968086
+  },
+  "total_packets_out": {
+    "mean": 3348.9513888888887,
+    "std": 4244.521720286524
+  },
+  "avg_bytes_per_flow": {
+    "mean": 54135.171990740746,
+    "std": 72013.15280989898
+  },
+  "num_flows": {
+    "mean": 44.0,
+    "std": 22.706396005980775
+  },
+  "unique_dst_ips": {
+    "mean": 1.3333333333333333,
+    "std": 0.47304991679126607
+  },
+  "unique_dst_ports": {
+    "mean": 1.0,
+    "std": 1e-06
+  },
+  "unique_protocols": {
+    "mean": 1.0,
+    "std": 1e-06
+  },
+  "external_ratio": {
+    "mean": 0.3333333333333333,
+    "std": 0.4730499167912662
+  },
+  "avg_duration": {
+    "mean": 21.0,
+    "std": 27.67645233742963
+  }
+}

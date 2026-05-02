@@ -5,8 +5,13 @@ All data is real, read directly from pipeline output CSVs.
 
 import os
 import sys
+import shutil
+import subprocess
+import asyncio
 import pandas as pd
-from fastapi import FastAPI
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # Add project root to sys.path so we can import config/
@@ -14,7 +19,18 @@ PROJECT_ROOT_FOR_IMPORT = os.path.dirname(os.path.dirname(os.path.abspath(__file
 if PROJECT_ROOT_FOR_IMPORT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT_FOR_IMPORT)
 
-app = FastAPI(title="IoT Trust & Drift API")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    """Startup: launch the WebSocket broadcast loop."""
+    print("[Startup] FastAPI server starting...")
+    asyncio.create_task(_broadcast_live_data_loop())
+    print("[Startup] WebSocket broadcast loop started")
+    print("[Startup] Server ready! Listening on http://0.0.0.0:8002")
+    yield
+
+app = FastAPI(title="IoT Trust & Drift API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,12 +49,208 @@ DEVICE_DESCRIPTIONS = {
     "AccessController": "Badge reader authenticating to internal server",
 }
 
+# Global simulation state
+SIMULATION_MODE = "normal"  # default: clean baseline only
+
 
 def load_csv(filename):
+    """Load CSV with optimized engine for speed."""
     path = os.path.join(DATA_DIR, filename)
     if not os.path.exists(path):
         return pd.DataFrame()
-    return pd.read_csv(path)
+    return pd.read_csv(path, engine='c')  # C engine is faster
+
+
+def _ensure_backup():
+    """Back up the original CSVs so we can restore them (fast, only if needed)."""
+    for fname in ["feature_vectors", "full_dataset"]:
+        backup = os.path.join(DATA_DIR, f"{fname}_original.csv")
+        source = os.path.join(DATA_DIR, f"{fname}.csv")
+        if not os.path.exists(backup) and os.path.exists(source):
+            shutil.copy2(source, backup)
+            print(f"[Startup] Backed up {fname}.csv")
+
+
+def _trim_to_baseline(skip_if_exists=True):
+    """
+    Trim full_dataset.csv and feature_vectors.csv to baseline-only
+    (first 48 hours — no attack traffic) and re-run the pipeline.
+    This ensures all devices start as green / Low severity.
+    
+    Args:
+        skip_if_exists: If True, skip if baseline files already exist and look correct
+    """
+    # Check if we should skip (fast path)
+    if skip_if_exists:
+        trust_scores_path = os.path.join(DATA_DIR, "trust_scores.csv")
+        if os.path.exists(trust_scores_path):
+            # Quick check: if trust_scores exists and has data, assume baseline is ready
+            try:
+                trust_df = pd.read_csv(trust_scores_path, nrows=1)
+                if not trust_df.empty:
+                    print("[Startup] Baseline files exist, skipping pipeline re-run")
+                    return
+            except:
+                pass  # If read fails, continue with setup
+    
+    # Trim full_dataset.csv
+    full_backup = os.path.join(DATA_DIR, "full_dataset_original.csv")
+    full_target = os.path.join(DATA_DIR, "full_dataset.csv")
+    if os.path.exists(full_backup):
+        raw = pd.read_csv(full_backup, parse_dates=["timestamp"], engine='c')
+    elif os.path.exists(full_target):
+        raw = pd.read_csv(full_target, parse_dates=["timestamp"], engine='c')
+    else:
+        return
+    cutoff = raw["timestamp"].min() + pd.Timedelta(hours=48)
+    raw_clean = raw[raw["timestamp"] < cutoff]
+    raw_clean.to_csv(full_target, index=False)
+
+    # Trim feature_vectors.csv
+    feat_backup = os.path.join(DATA_DIR, "feature_vectors_original.csv")
+    feat_target = os.path.join(DATA_DIR, "feature_vectors.csv")
+    if os.path.exists(feat_backup):
+        feat = pd.read_csv(feat_backup, engine='c')
+    elif os.path.exists(feat_target):
+        feat = pd.read_csv(feat_target, engine='c')
+    else:
+        return
+    col = "window" if "window" in feat.columns else "window_start"
+    feat[col] = pd.to_datetime(feat[col])
+    feat_cutoff = feat[col].min() + pd.Timedelta(hours=48)
+    feat_clean = feat[feat[col] < feat_cutoff]
+    feat_clean.to_csv(feat_target, index=False)
+
+    # Re-run pipeline with clean data (in background to not block startup)
+    print("[Startup] Re-running pipeline in background...")
+    subprocess.Popen(
+        [sys.executable, "run_pipeline.py"],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+# Create backups on server start (fast, non-blocking)
+print("[Startup] Initializing server...")
+_ensure_backup()
+# Start with clean baseline - skip if already exists (fast startup)
+_trim_to_baseline(skip_if_exists=True)
+print("[Startup] Initialization complete")
+
+
+# ── Live Engine + Real Traffic Capture ────────────────
+from simulators.live_engine import LiveEngine
+from simulators.live_capture import LiveNetworkCapture
+
+_live_engine = LiveEngine()
+_live_capture = LiveNetworkCapture()
+
+# Auto-start real traffic capture so data is available immediately
+_live_capture.start()
+
+# WebSocket connected clients
+_ws_clients: set = set()
+
+
+async def _broadcast_live_data_loop():
+    """Background task: push real-time traffic data to all WebSocket clients every second.
+    All blocking calls (lock-acquiring) are offloaded to thread pool so the event loop
+    is never blocked, keeping all HTTP endpoints responsive.
+    """
+    loop = asyncio.get_event_loop()
+    while True:
+        if _ws_clients:
+            try:
+                # Offload ALL blocking/lock calls to thread pool — never block the event loop
+                snapshot = await loop.run_in_executor(None, _live_capture.get_latest)
+                scored = await loop.run_in_executor(None, lambda: _live_capture.get_scored_history(last_n=1))
+                capture_status = await loop.run_in_executor(None, _live_capture.get_status)
+                scoring = scored[-1] if scored else None
+
+                if _live_engine.running:
+                    sim_status = await loop.run_in_executor(None, _live_engine.get_live_stats)
+                else:
+                    sim_status = None
+
+                payload = {
+                    "type": "realtime",
+                    "timestamp": datetime.now().isoformat(),
+                    "real_traffic": snapshot,
+                    "scoring": scoring,
+                    "capture_status": capture_status,
+                    "simulation": sim_status,
+                }
+
+                dead = set()
+                for ws in list(_ws_clients):
+                    try:
+                        await ws.send_json(payload)
+                    except Exception:
+                        dead.add(ws)
+                _ws_clients.difference_update(dead)
+            except Exception as e:
+                print(f"[Broadcast] Error: {e}")
+
+        await asyncio.sleep(1)
+
+
+# ── Simulation Control ──────────────────────────────────
+
+@app.post("/api/simulate")
+def simulate(mode: str = "normal"):
+    """
+    Toggle between normal and attack mode, re-run the full pipeline.
+      mode="normal"  -> only first 48 hours (baseline, no attacks)
+      mode="attack"  -> full dataset including CCTV attack hours
+    """
+    global SIMULATION_MODE
+    SIMULATION_MODE = mode
+
+    backup = os.path.join(DATA_DIR, "feature_vectors_original.csv")
+    target = os.path.join(DATA_DIR, "feature_vectors.csv")
+
+    # Always read from the original backup
+    if os.path.exists(backup):
+        feat_df = pd.read_csv(backup, engine='c')
+    else:
+        feat_df = pd.read_csv(target, engine='c')
+
+    if "window_start" in feat_df.columns:
+        feat_df = feat_df.rename(columns={"window_start": "window"})
+    feat_df["window"] = pd.to_datetime(feat_df["window"])
+
+    if mode == "normal":
+        # Keep only first 48 hours (clean baseline — no attacks)
+        cutoff = feat_df["window"].min() + pd.Timedelta(hours=48)
+        filtered = feat_df[feat_df["window"] < cutoff]
+    else:
+        # Full dataset including attack hours 49-72
+        filtered = feat_df
+
+    # Overwrite feature_vectors.csv with the selected data
+    filtered.to_csv(target, index=False)
+
+    # Re-run the full pipeline
+    result = subprocess.run(
+        [sys.executable, "run_pipeline.py"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    return {
+        "status": "done",
+        "mode": mode,
+        "windows": len(filtered),
+        "message": f"Pipeline re-run in {mode} mode with {len(filtered)} windows",
+    }
+
+
+@app.get("/api/simulation-status")
+def get_simulation_status():
+    """Current simulation mode."""
+    return {"mode": SIMULATION_MODE}
 
 
 # ── Dashboard ──
@@ -519,6 +731,534 @@ def get_device_assessment(device_id: str):
     }
 
 
+# ── Attack Injection System ──────────────────────────────
+#    Generates realistic attack traffic, re-runs pipeline,
+#    and produces live alerts.
+
+# Import the attack injector
+from simulators.attack_injector import (
+    ATTACK_CATALOG,
+    generate_attack_flows,
+    extract_features,
+    get_device_type,
+)
+
+# Track active injections in memory
+_active_injections: dict = {}
+
+
+class InjectRequest(BaseModel):
+    device_id: str
+    attack_type: str
+
+
+@app.get("/api/attack-catalog")
+def get_attack_catalog():
+    """Return the full attack catalog grouped by device type."""
+    return {
+        dtype: [
+            {"id": a["id"], "name": a["name"], "description": a["description"], "mitre": a["mitre"]}
+            for a in attacks
+        ]
+        for dtype, attacks in ATTACK_CATALOG.items()
+    }
+
+
+@app.get("/api/injection-status")
+def get_injection_status():
+    """Return currently active injections."""
+    return {"active_injections": _active_injections}
+
+
+@app.post("/api/inject-attack")
+def inject_attack(req: InjectRequest):
+    """
+    Inject an attack for a given device:
+      1. Generate realistic attack flows
+      2. Append to full_dataset.csv
+      3. Re-extract features into feature_vectors.csv
+      4. Re-run the full ML pipeline
+      5. Return updated active_injections state
+    """
+    global _active_injections
+
+    device_id = req.device_id
+    attack_type = req.attack_type
+    device_type = get_device_type(device_id)
+
+    # Find attack metadata
+    catalog_entry = None
+    for a in ATTACK_CATALOG.get(device_type, []):
+        if a["id"] == attack_type:
+            catalog_entry = a
+            break
+    if catalog_entry is None:
+        return {"error": f"Unknown attack: {device_type}/{attack_type}"}
+
+    # Read the current full dataset
+    full_ds_path = os.path.join(DATA_DIR, "full_dataset.csv")
+    backup_full = os.path.join(DATA_DIR, "full_dataset_original.csv")
+
+    # Back up original full_dataset if not yet done
+    if not os.path.exists(backup_full) and os.path.exists(full_ds_path):
+        shutil.copy2(full_ds_path, backup_full)
+
+    raw_df = pd.read_csv(full_ds_path, parse_dates=["timestamp"], engine='c')
+
+    # Determine attack start time: after the last timestamp in the dataset
+    last_time = raw_df["timestamp"].max()
+    attack_start = last_time + timedelta(hours=1)
+
+    # Generate attack flows (2 hours of attack traffic)
+    attack_flows = generate_attack_flows(device_id, attack_type, attack_start, duration_minutes=120)
+    attack_df = pd.DataFrame(attack_flows)
+    attack_df["timestamp"] = pd.to_datetime(attack_df["timestamp"])
+
+    # Append attack flows to full_dataset.csv
+    combined_raw = pd.concat([raw_df, attack_df], ignore_index=True)
+    combined_raw.to_csv(full_ds_path, index=False)
+
+    # Re-extract features from the combined dataset
+    features = extract_features(combined_raw)
+    feat_path = os.path.join(DATA_DIR, "feature_vectors.csv")
+
+    # Backup original feature vectors
+    feat_backup = os.path.join(DATA_DIR, "feature_vectors_original.csv")
+    if not os.path.exists(feat_backup):
+        orig_feat = pd.read_csv(feat_path, engine='c')
+        orig_feat.to_csv(feat_backup, index=False)
+
+    features.to_csv(feat_path, index=False)
+
+    # Re-run the full pipeline
+    result = subprocess.run(
+        [sys.executable, "run_pipeline.py"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # Record active injection
+    _active_injections[device_id] = {
+        "attack_type": attack_type,
+        "attack_name": catalog_entry["name"],
+        "mitre": catalog_entry["mitre"],
+        "description": catalog_entry["description"],
+        "injected_at": datetime.now().isoformat(),
+        "attack_flows": len(attack_flows),
+    }
+
+    return {
+        "status": "injected",
+        "device_id": device_id,
+        "attack_type": attack_type,
+        "attack_name": catalog_entry["name"],
+        "flows_injected": len(attack_flows),
+        "pipeline_stdout": result.stdout[-500:] if result.stdout else "",
+        "active_injections": _active_injections,
+    }
+
+
+@app.post("/api/reset")
+def reset_to_baseline():
+    """
+    Reset everything to clean baseline (first 48 hours only):
+      1. Restore full_dataset.csv from backup
+      2. Restore feature_vectors.csv from backup
+      3. Trim both to first 48 hours
+      4. Re-run the pipeline (blocking — waits for completion)
+      5. Clear active injections
+    All devices will return to green / Low severity.
+    """
+    global _active_injections
+
+    full_ds_path   = os.path.join(DATA_DIR, "full_dataset.csv")
+    feat_path      = os.path.join(DATA_DIR, "feature_vectors.csv")
+    backup_full    = os.path.join(DATA_DIR, "full_dataset_original.csv")
+    backup_feat    = os.path.join(DATA_DIR, "feature_vectors_original.csv")
+
+    # ── Step 1: Restore full_dataset from backup and trim to 48 h ──
+    src_full = backup_full if os.path.exists(backup_full) else full_ds_path
+    raw = pd.read_csv(src_full, parse_dates=["timestamp"], engine='c')
+    cutoff = raw["timestamp"].min() + pd.Timedelta(hours=48)
+    raw[raw["timestamp"] < cutoff].to_csv(full_ds_path, index=False)
+
+    # ── Step 2: Restore feature_vectors from backup and trim to 48 h ──
+    src_feat = backup_feat if os.path.exists(backup_feat) else feat_path
+    feat = pd.read_csv(src_feat, engine='c')
+    col = "window" if "window" in feat.columns else "window_start"
+    feat[col] = pd.to_datetime(feat[col])
+    feat_cutoff = feat[col].min() + pd.Timedelta(hours=48)
+    feat[feat[col] < feat_cutoff].to_csv(feat_path, index=False)
+
+    # ── Step 3: Re-run the full pipeline (blocking — must finish before returning) ──
+    subprocess.run(
+        [sys.executable, "run_pipeline.py"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # ── Step 4: Clear active injections ──
+    _active_injections = {}
+
+    return {
+        "status": "reset",
+        "message": "System restored to clean baseline — all devices green",
+        "active_injections": {},
+    }
+
+
+@app.post("/api/reset-device/{device_id}")
+def reset_device(device_id: str):
+    """
+    Remove injected attack data for a single device and re-run the pipeline.
+      1. Remove rows for this device that are beyond the 48-hour baseline window
+         (cutoff is read from the original backup to get the true baseline start)
+      2. Re-extract features
+      3. Re-run the full ML pipeline (blocking)
+      4. Clear this device from active injections
+    """
+    global _active_injections
+
+    full_ds_path = os.path.join(DATA_DIR, "full_dataset.csv")
+    feat_path    = os.path.join(DATA_DIR, "feature_vectors.csv")
+    backup_full  = os.path.join(DATA_DIR, "full_dataset_original.csv")
+    backup_feat  = os.path.join(DATA_DIR, "feature_vectors_original.csv")
+
+    # --- Determine the 48-h cutoff from the ORIGINAL backup (not the modified file) ---
+    ref_path = backup_full if os.path.exists(backup_full) else full_ds_path
+    ref_df   = pd.read_csv(ref_path, parse_dates=["timestamp"], engine='c')
+    cutoff   = ref_df["timestamp"].min() + pd.Timedelta(hours=48)
+
+    # --- Clean full_dataset.csv: drop attack rows for this device past cutoff ---
+    raw_df  = pd.read_csv(full_ds_path, parse_dates=["timestamp"], engine='c')
+    cleaned = raw_df[~((raw_df["device_id"] == device_id) & (raw_df["timestamp"] >= cutoff))]
+    cleaned.to_csv(full_ds_path, index=False)
+
+    # --- Re-extract features from the original backup (or cleaned dataset) ---
+    # Re-use feature backup if available (faster and more accurate baseline)
+    if os.path.exists(backup_feat):
+        feat_orig = pd.read_csv(backup_feat, engine='c')
+        col = "window" if "window" in feat_orig.columns else "window_start"
+        feat_orig[col] = pd.to_datetime(feat_orig[col])
+        feat_cutoff = feat_orig[col].min() + pd.Timedelta(hours=48)
+        # Keep all feature rows not belonging to this device past cutoff
+        feat_clean = feat_orig[~((feat_orig["device_id"] == device_id) & (feat_orig[col] >= feat_cutoff))]
+        feat_clean.to_csv(feat_path, index=False)
+    else:
+        from simulators.attack_injector import extract_features
+        features = extract_features(cleaned)
+        features.to_csv(feat_path, index=False)
+
+    # --- Re-run the full pipeline (blocking) ---
+    subprocess.run(
+        [sys.executable, "run_pipeline.py"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    # Remove from active injections
+    _active_injections.pop(device_id, None)
+
+    return {
+        "status": "reset",
+        "device_id": device_id,
+        "message": f"Attack removed for {device_id} — device restored to baseline",
+        "active_injections": _active_injections,
+    }
+
+
+# ══════════════════════════════════════════════════════════
+#  LIVE MODE — Real-Time Traffic Capture + Simulation
+# ══════════════════════════════════════════════════════════
+
+
+class LiveInjectRequest(BaseModel):
+    device_id: str
+    attack_type: str
+
+
+# ── WebSocket endpoint (1-second push) ──
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    """WebSocket for real-time traffic streaming (1 push/sec)."""
+    await websocket.accept()
+    _ws_clients.add(websocket)
+    print(f"[WS] Client connected. Total clients: {len(_ws_clients)}")
+    try:
+        # Keep connection alive - wait for disconnect
+        # The broadcast loop (_broadcast_live_data_loop) sends data to all clients
+        while True:
+            # Wait for any message or disconnect
+            try:
+                await websocket.receive_text()
+            except:
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[WS] Error: {e}")
+    finally:
+        _ws_clients.discard(websocket)
+        print(f"[WS] Client disconnected. Total clients: {len(_ws_clients)}")
+
+
+# ── Real Traffic Capture endpoints ──
+
+@app.get("/api/live/capture/status")
+def live_capture_status():
+    """Status of real-time network capture."""
+    return _live_capture.get_status()
+
+
+@app.post("/api/live/capture/start")
+def live_capture_start():
+    """Start real-time network capture."""
+    _live_capture.start()
+    return {"status": "started", "interface": _live_capture.interface_name}
+
+
+@app.post("/api/live/capture/stop")
+def live_capture_stop():
+    """Stop real-time network capture."""
+    _live_capture.stop()
+    return {"status": "stopped"}
+
+
+@app.post("/api/live/capture/reset")
+def live_capture_reset():
+    """Reset capture — clear data, re-learn baseline."""
+    _live_capture.reset()
+    _live_capture.start()
+    return {"status": "reset"}
+
+
+@app.get("/api/live/capture/snapshots")
+def live_capture_snapshots(last_n: int = 60):
+    """Get recent traffic snapshots."""
+    return _live_capture.get_snapshots(last_n=last_n)
+
+
+@app.get("/api/live/capture/scored")
+def live_capture_scored(last_n: int = 100):
+    """Get scored traffic history."""
+    return _live_capture.get_scored_history(last_n=last_n)
+
+
+@app.get("/api/live/capture/alerts")
+def live_capture_alerts(last_n: int = 50):
+    """Get real-traffic alerts."""
+    return _live_capture.get_alerts(last_n=last_n)
+
+
+# ── Simulation Live Mode endpoints ──
+
+@app.get("/api/live/status")
+def live_status():
+    """Status of both real capture + simulated live engine."""
+    cap_status = _live_capture.get_status()
+    sim_status = _live_engine.get_live_stats()
+    return {**sim_status, "capture": cap_status}
+
+
+@app.get("/api/live/timeline")
+def live_timeline(last_n: int = 100):
+    """Get simulated device timeline."""
+    return _live_engine.get_timeline(last_n=last_n)
+
+
+@app.get("/api/live/anomalies")
+def live_anomalies(last_n: int = 50):
+    """Get anomalous windows from simulation."""
+    return _live_engine.get_anomaly_feed(last_n=last_n)
+
+
+@app.get("/api/live/unknown-ips")
+def live_unknown_ips(last_n: int = 50):
+    """Get unknown IPs from simulation."""
+    return _live_engine.get_unknown_ips(last_n=last_n)
+
+
+@app.get("/api/live/violations")
+def live_violations(last_n: int = 50):
+    """Get policy violations from simulation."""
+    return _live_engine.get_violations(last_n=last_n)
+
+
+@app.post("/api/live/start")
+def live_start(interval: int = 10):
+    """Start simulated live data generation."""
+    _live_engine.start(tick_interval=interval)
+    return {"status": "started", "interval": interval}
+
+
+@app.post("/api/live/stop")
+def live_stop():
+    """Stop simulated live data generation."""
+    _live_engine.stop()
+    return {"status": "stopped"}
+
+
+@app.post("/api/live/reset")
+def live_reset():
+    """Reset simulated live data."""
+    _live_engine.reset()
+    return {"status": "reset"}
+
+
+@app.post("/api/live/inject")
+def live_inject(req: LiveInjectRequest):
+    """Inject attack in live simulation mode."""
+    result = _live_engine.inject_attack(req.device_id, req.attack_type)
+    return result
+
+
+@app.post("/api/live/clear-attack")
+def live_clear_attack(device_id: str):
+    """Clear attack from a device in live mode."""
+    _live_engine.clear_attack(device_id)
+    return {"status": "cleared", "device_id": device_id}
+
+
+# ══════════════════════════════════════════════════════════════
+#  PHONE AGENT INTEGRATION  — /api/phone/*
+#  Phones run agent.py (Termux) and POST telemetry here every 8s.
+#  We score it inline using the same LiveEngine ML pipeline.
+# ══════════════════════════════════════════════════════════════
+
+import socket as _socket
+import threading as _threading
+import collections
+
+class PhoneTelemetry(BaseModel):
+    device_id: str
+    window_start: str
+    total_bytes_out: float
+    total_packets_out: float
+    avg_bytes_per_flow: float
+    num_flows: float
+    unique_dst_ips: float
+    unique_dst_ports: float
+    unique_protocols: float
+    external_ratio: float
+    avg_duration: float
+    mode: str = "normal"          # "normal" | "malicious"
+
+DEVICE_TYPE_MAP = {
+    "CCTV_01":   "CCTV",
+    "Router_01": "Router",
+    "Access_01": "AccessController",
+}
+
+# Rolling store (thread-safe)
+_phone_lock    = _threading.Lock()
+_phone_history = collections.deque(maxlen=500)   # last 500 readings
+_phone_agents  = {}                               # device_id → latest scored record
+
+def _get_local_ip() -> str:
+    """Get the WiFi/LAN IP address of this laptop."""
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+@app.get("/api/phone/connection-info")
+def phone_connection_info():
+    """Returns the laptop's LAN IP so phones know where to connect."""
+    ip = _get_local_ip()
+    return {
+        "server_url": f"http://{ip}:8002",
+        "laptop_ip":  ip,
+        "port":        8002,
+        "endpoint":   "/api/phone/telemetry",
+        "hint":       f"Run on phone:  python agent.py --role CCTV_01 --server http://{ip}:8002",
+    }
+
+
+@app.post("/api/phone/telemetry")
+def phone_telemetry(payload: PhoneTelemetry):
+    """
+    Receive a telemetry window from a phone agent.
+    Score it with Isolation Forest + Drift + Policy + Trust.
+    Return trust_score and risk_level to the phone agent immediately.
+    """
+    device_type = DEVICE_TYPE_MAP.get(payload.device_id, "CCTV")
+
+    features = {
+        "total_bytes_out":    payload.total_bytes_out,
+        "total_packets_out":  payload.total_packets_out,
+        "avg_bytes_per_flow": payload.avg_bytes_per_flow,
+        "num_flows":          payload.num_flows,
+        "unique_dst_ips":     payload.unique_dst_ips,
+        "unique_dst_ports":   payload.unique_dst_ports,
+        "unique_protocols":   payload.unique_protocols,
+        "external_ratio":     payload.external_ratio,
+        "avg_duration":       payload.avg_duration,
+    }
+
+    # Score inline — reuse LiveEngine ML pipeline
+    # Pass empty raw_flows; bandwidth + anomaly + drift checks still fire.
+    scored = _live_engine._score_single_window(
+        device_id=payload.device_id,
+        device_type=device_type,
+        features=features,
+        raw_flows=[],
+        window_str=payload.window_start,
+    )
+
+    record = {
+        **scored,
+        "mode":            payload.mode,
+        "received_at":     datetime.now().isoformat(),
+        "source":          "phone_agent",
+        # Mirror the raw feature fields for charts
+        "external_ratio":  payload.external_ratio,
+        "total_bytes_out": payload.total_bytes_out,
+        "num_flows":       payload.num_flows,
+        "unique_dst_ips":  payload.unique_dst_ips,
+    }
+
+    with _phone_lock:
+        _phone_history.append(record)
+        _phone_agents[payload.device_id] = record
+
+    return {
+        "status":      "ok",
+        "device_id":   payload.device_id,
+        "trust_score": round(scored["trust_score_smoothed"], 1),
+        "risk_level":  scored["severity"],
+        "anomaly":     scored["is_anomaly"],
+        "drift":       scored["drift_class"],
+        "policy":      scored["policy_status"],
+        "mode":        payload.mode,
+    }
+
+
+@app.get("/api/phone/devices")
+def phone_devices():
+    """All phone agents that have sent at least one telemetry window."""
+    with _phone_lock:
+        return list(_phone_agents.values())
+
+
+@app.get("/api/phone/history")
+def phone_history(device_id: str = None, last_n: int = 100):
+    """Recent phone telemetry history, optionally filtered by device_id."""
+    with _phone_lock:
+        data = list(_phone_history)
+    if device_id:
+        data = [d for d in data if d["device_id"] == device_id]
+    return data[-last_n:]
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

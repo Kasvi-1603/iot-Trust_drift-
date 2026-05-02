@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, ReferenceLine, BarChart, Bar, Legend,
 } from 'recharts';
 
-const API = 'http://localhost:8001/api';
+const API = 'http://localhost:8002/api';
 
 function severityClass(s) { return (s || 'low').toLowerCase(); }
 

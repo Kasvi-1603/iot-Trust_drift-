@@ -6,7 +6,7 @@ import {
   BarChart, Bar,
 } from 'recharts';
 
-const API = 'http://localhost:8001/api';
+const API = 'http://localhost:8002/api';
 const DEVICE_COLORS = { CCTV_01: '#3b82f6', Router_01: '#f59e0b', Access_01: '#22c55e' };
 const PIE_COLORS = ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4'];
 

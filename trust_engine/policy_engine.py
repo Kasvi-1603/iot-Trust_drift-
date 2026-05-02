@@ -6,7 +6,11 @@ Enhanced policy engine for visualization dashboards.
 
 from dataclasses import dataclass, field
 from typing import List, Set, Dict
-from trust_engine.device_profiles import get_profile, is_internal_ip
+import os, sys
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.device_profiles import get_profile, is_internal_ip
 from datetime import datetime
 
 
@@ -105,7 +109,7 @@ def evaluate_policy(
 
     bad_ips = {
         ip for ip in observed_ips
-        if ip not in profile["expected_dst_ips"] and not is_internal_ip(ip)
+        if ip not in profile["allowed_dst_ips"] and not is_internal_ip(ip)
     }
 
     if bad_ips:

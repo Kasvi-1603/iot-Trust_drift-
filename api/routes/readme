@@ -1,0 +1,33 @@
+Install the WebSocket package
+bashcd your-project-root
+npm install ws
+
+PHASE 3 — USB/ADB Cable Option
+If you want phones connected via USB cable instead of Wi-Fi:
+bash# On your laptop, with phone USB-connected and USB debugging ON:
+adb reverse tcp:5000 tcp:5000
+
+# Now on the phone in Termux, use localhost:
+python agent.py --role cctv --mode malicious --server http://localhost:5000
+
+Enable USB debugging: Settings → Developer Options → USB Debugging. Run adb devices to verify the phone is recognized.
+
+
+python agent.py --role cctv --mode malicious --server https://your-backend.onrender.com
+```
+
+---
+
+## Quick Start Checklist
+```
+[ ] 1. Find laptop IP (ipconfig / ip a)
+[ ] 2. Start your backend: node api/server.js
+[ ] 3. Open port 5000 in firewall if needed
+[ ] 4. Copy agent.py to each phone via Termux:
+        curl -O http://YOUR_IP:8080/agent.py  (serve with: python -m http.server 8080)
+[ ] 5. Run agent on Phone A (CCTV)
+[ ] 6. Run agent on Phone B (Access Controller)
+[ ] 7. Run agent on Phone C (Router)
+[ ] 8. Open dashboard — devices appear in real time
+[ ] 9. Click mode buttons to toggle malicious/normal
+[ ] 10. For USB: adb reverse tcp:5000 tcp:5000 first

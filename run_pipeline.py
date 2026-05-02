@@ -115,8 +115,8 @@ def run_pipeline():
         policy_results.append({
             "device_id": result.device_id,
             "device_type": result.device_type,
-            "window": result.window,
-            "policy_status": result.policy_status,
+            "window": result.window_start,
+            "policy_status": result.status,
             "violations": "; ".join(result.violations) if result.violations else "none",
             "penalty": result.penalty,
         })
