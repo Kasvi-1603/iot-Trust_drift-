@@ -3,8 +3,7 @@ node_modules/
 __pycache__/
 *.pyc
 
-# Docs (not needed in repo)
-*.md
+# Optional local notes (keep README.md tracked at repo root)
 *.txt
 
 # IDE
